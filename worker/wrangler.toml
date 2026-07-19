@@ -1,0 +1,24 @@
+name = "yieldlens"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+account_id = "CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER"
+
+[define]
+APP_VERSION = "__APP_VERSION__"
+
+[assets]
+directory = "../web/dist"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "yieldlens"
+database_id = "D1_DATABASE_ID_PLACEHOLDER"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "KV_NAMESPACE_ID_PLACEHOLDER"
+
+[vars]
+TABLE_PREFIX = ""

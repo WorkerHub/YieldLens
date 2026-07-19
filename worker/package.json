@@ -1,0 +1,22 @@
+{
+  "name": "worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "sed 's/{prefix}//g' src/db/schema.sql > .schema.local.sql && wrangler d1 execute DB --local --file=.schema.local.sql && rm .schema.local.sql",
+    "db:seed:local": "wrangler d1 execute DB --local --file=seed.sql",
+    "db:migrate:remote": "sed 's/{prefix}//g' src/db/schema.sql > .schema.remote.sql && wrangler d1 execute DB --remote --file=.schema.remote.sql && rm .schema.remote.sql"
+  },
+  "dependencies": {
+    "hono": "^4.7.9"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250508.0",
+    "wrangler": "^4.14.1",
+    "typescript": "^6.0.0"
+  }
+}

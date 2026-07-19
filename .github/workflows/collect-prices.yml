@@ -1,0 +1,59 @@
+name: Collect Stock Prices
+
+# Runs during A-share trading hours (09:30-15:00 Beijing time, UTC+8; lunch
+# break 11:30-13:00 skipped), roughly every 30 minutes. GitHub Actions cron
+# has no exact-time guarantee, so this is "frequent intraday polling," not
+# real-time — see PRD.md section 7.2.2 for the tradeoff discussion.
+#
+# NOTE (known limitation, tune after first deployment): collect_prices.py's
+# incremental mode fetches every stock whose price hasn't been updated today,
+# rate-limited to ~1 request/sec against Sina. On the first run of a trading
+# day this means ~5000+ sequential HTTP calls, which will exceed this job's
+# 25-minute timeout on the full A-share universe. Before relying on this in
+# production, either (a) split incremental collection into batches the same
+# way BACKFILL_BATCH does for the initial backfill, or (b) raise timeout-minutes
+# and accept a slower per-run cadence.
+on:
+  schedule:
+    - cron: "30 1 * * 1-5"  # 09:30 CST
+    - cron: "0 2 * * 1-5"   # 10:00 CST
+    - cron: "30 2 * * 1-5"  # 10:30 CST
+    - cron: "0 3 * * 1-5"   # 11:00 CST
+    - cron: "30 3 * * 1-5"  # 11:30 CST
+    # lunch break 11:30-13:00 CST — no runs
+    - cron: "0 5 * * 1-5"   # 13:00 CST
+    - cron: "30 5 * * 1-5"  # 13:30 CST
+    - cron: "0 6 * * 1-5"   # 14:00 CST
+    - cron: "30 6 * * 1-5"  # 14:30 CST
+    - cron: "0 7 * * 1-5"   # 15:00 CST (closing prices)
+  workflow_dispatch:
+    inputs:
+      backfill_batch:
+        description: "Backfill batch index (0-49). Leave empty for incremental mode."
+        required: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: python-collector/requirements.txt
+
+      - run: pip install -r python-collector/requirements.txt
+
+      - name: Run price collector
+        working-directory: python-collector
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TABLE_PREFIX: ${{ vars.TABLE_PREFIX }}
+          BACKFILL_MODE: ${{ github.event.inputs.backfill_batch != '' && 'true' || 'false' }}
+          BACKFILL_BATCH: ${{ github.event.inputs.backfill_batch || '0' }}
+        run: python collect_prices.py

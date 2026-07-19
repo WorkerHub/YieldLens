@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+web/dist/
+worker/dist/
+
+# Cloudflare Workers local state
+.wrangler/
+*.sqlite
+
+# Environment / secrets
+.env
+.env.local
+python-collector/.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+PRD.md

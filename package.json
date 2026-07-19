@@ -1,0 +1,28 @@
+{
+  "name": "yieldlens",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"pnpm dev:worker\" \"pnpm dev:web\"",
+    "dev:web": "pnpm --filter web dev",
+    "dev:worker": "pnpm --filter worker dev",
+    "lint": "biome lint .",
+    "format:check": "biome format .",
+    "format": "biome format --write .",
+    "build": "pnpm --filter web build && pnpm --filter worker build",
+    "build:web": "pnpm --filter web build",
+    "build:worker": "pnpm --filter worker build",
+    "deploy": "pnpm build:web && sed -i '' \"s/__APP_VERSION__/'$(node -p \"require('./package.json').version\")'/g\" worker/wrangler.toml && cd worker && pnpm deploy && git checkout -- wrangler.toml",
+    "typecheck": "pnpm --filter web typecheck && pnpm --filter worker typecheck"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.0",
+    "concurrently": "^10.0.3",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "packageManager": "pnpm@11.9.0"
+}

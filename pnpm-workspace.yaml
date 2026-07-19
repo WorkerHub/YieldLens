@@ -1,0 +1,8 @@
+packages:
+  - web
+  - worker
+allowBuilds:
+  '@biomejs/biome': true
+  esbuild: true
+  sharp: true
+  workerd: true
