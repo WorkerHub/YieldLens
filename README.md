@@ -54,6 +54,10 @@ pnpm install
 cd worker
 pnpm db:migrate:local   # 建表
 pnpm db:seed:local      # 灌入样例数据（15只代表性股票，含10年模拟历史数据）
+
+# 使用非空表前缀时，建表和 seed 也必须带同一个前缀：
+TABLE_PREFIX=yl pnpm db:migrate:local
+TABLE_PREFIX=yl pnpm db:seed:local
 ```
 
 ### 3. 启动开发环境
@@ -109,9 +113,23 @@ pnpm deploy
 cd python-collector
 pip install -r requirements.txt
 cp .env.example .env   # 填入 Cloudflare 凭证
-python collect_prices.py       # 采集股价
-python collect_dividends.py    # 采集分红/基本面
+python collect_prices.py       # 采集股价（默认 PRICE_MODE=auto）
+python collect_dividends.py    # 采集分红/基本面（默认 COLLECT_MODE=daily）
+
+# 不依赖 Cloudflare 凭证的本地端到端验证（SQLite 模拟 D1 + AKShare fixture）：
+python tools/local_e2e.py
 ```
+
+价格采集模式（`PRICE_MODE`）：
+
+- `auto`（默认）：盘中用一次全市场快照，15:05（北京时间）后自动切到收盘覆盖；
+- `snapshot` / `close`：强制快照 / 收盘快照；
+- `history` / `backfill`：逐股日线回退，按 `PRICE_BATCH_SIZE` 分片（默认
+  history 600 只、backfill 30 只），每 10 只 checkpoint，18 分钟软截止；
+  游标存 `system_settings`，可断点续跑。
+
+分红采集模式（`COLLECT_MODE`）：`daily`（默认，最近 3 个已披露报告期）或
+`backfill`（`BACKFILL_PERIODS`，默认 20 个报告期 ≈ 10 年）。
 
 ### 运行单元测试
 
@@ -136,19 +154,28 @@ python -m unittest discover -s tests
 |---|---|
 | `TABLE_PREFIX` | 数据库表前缀，需与 `worker/wrangler.toml` 中的一致，默认为空 |
 
-两个 workflow 会在推送后按各自的 cron 调度自动运行：
+两个 workflow 合并到默认分支（`main`）后按各自的 cron 调度运行（cron 不会在
+普通 push 时触发）：
 
-- `.github/workflows/collect-prices.yml` — 交易时段内每30分钟采集股价
+- `.github/workflows/collect-prices.yml` — 交易时段内每 30 分钟采集全市场快照，
+  15:10 / 15:40 强制覆盖收盘价
 - `.github/workflows/collect-dividends.yml` — 每日收盘后采集分红与基本面数据
 
-首次上线需要手动触发一次全量历史回填（见下方"接下来要做什么"）。
+如果 `Collect Stock Prices` 在 Actions 页面被禁用，打开 **Actions → 左侧
+Collect Stock Prices → Enable workflow** 重新启用（或执行
+`gh workflow enable collect-prices.yml`）。
+
+首次上线需要手动触发一次全量历史回填：分红任务选择 `mode=backfill`；股价任务
+选择 `mode=backfill`，重复运行直到 `system_settings.price_backfill_completed_at`
+有值。完整步骤见 [docs/collector-fix-notes.md](./docs/collector-fix-notes.md)。
 
 ## 已知限制
 
 - **市值/行业快照接口未在生产环境验证**：`collect_dividends.py` 中通过 `ak.stock_zh_a_spot_em()` 获取市值/PE/PB/行业数据，该接口依赖东方财富的动态子域名，在开发本项目的沙盒环境中不可访问；已做 try/except 兜底，失败不影响分红数据采集，但需要在真实 GitHub Actions Runner 上验证。
 - **港股通标的暂未支持**：当前仅覆盖A股，港股通的标的名单获取方式仍需调研（详见 PRD.md 第10节）。
 - **账号系统、自选股、提醒推送均未实现**：属于第二期范围，当前为免登录只读MVP。
-- **股价采集为交易时段内轮询而非实时**：受 GitHub Actions cron 调度精度限制，存在数分钟至数十分钟延迟。
+- **股价采集为交易时段内轮询而非实时**：受 GitHub Actions cron 调度精度限制，存在数分钟至数十分钟延迟。全市场主路径依赖 `ak.stock_zh_a_spot_em()` 快照接口；不可用时回退到逐股分片，覆盖需要多次运行完成。
+- **分红重算仍是逐股进行**：首次 10 年全量回填 + 全市场收益率重算可能接近 55 分钟 job 上限，后续可拆分为独立任务。
 
 ## 许可证
 

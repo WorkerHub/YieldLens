@@ -97,7 +97,7 @@ pnpm db:migrate:remote
 pnpm deploy
 ```
 
-After the first deploy, replace the placeholder `account_id`, `database_id`, and KV `id` in `worker/wrangler.toml` with real values (they're placeholders by default to avoid committing sensitive info).
+Before deploying, replace the placeholder `account_id`, `database_id`, and KV `id` in `worker/wrangler.toml` with real values (they're placeholders by default to avoid committing sensitive info).
 
 ## Data Collection
 
@@ -109,9 +109,21 @@ Data collection runs as Python scripts independent of Cloudflare, scheduled via 
 cd python-collector
 pip install -r requirements.txt
 cp .env.example .env   # fill in your Cloudflare credentials
-python collect_prices.py       # collect stock prices
-python collect_dividends.py    # collect dividends / fundamentals
+python collect_prices.py       # collect stock prices (PRICE_MODE=auto by default)
+python collect_dividends.py    # collect dividends / fundamentals (COLLECT_MODE=daily)
+
+# Credential-free end-to-end check (SQLite-backed D1 + AKShare fixtures):
+python tools/local_e2e.py
 ```
+
+Price modes (`PRICE_MODE`): `auto` (full-market snapshot intraday, `close` after
+15:05 Beijing time), `snapshot`, `close`, `history`, `backfill`. Per-stock
+`history`/`backfill` runs are sharded (default 600 history / 30 backfill stocks),
+checkpointed every 10 stocks with an 18-minute soft deadline, and resume from a
+cursor in `system_settings`.
+
+Dividend modes (`COLLECT_MODE`): `daily` (last three disclosed report periods)
+or `backfill` (`BACKFILL_PERIODS`, default 20 periods ≈ 10 years).
 
 ### Run unit tests
 
@@ -136,12 +148,19 @@ Add this to Variables (optional):
 |---|---|
 | `TABLE_PREFIX` | Database table prefix, must match `worker/wrangler.toml`; defaults to empty |
 
-Two workflows run automatically on their own cron schedules once pushed:
+Two workflows run on their own cron schedules once the changes are on the
+default branch (`main`); cron does not fire on a normal push:
 
-- `.github/workflows/collect-prices.yml` — collects prices every 30 minutes during trading hours
-- `.github/workflows/collect-dividends.yml` — collects dividends and fundamentals daily after market close
+- `.github/workflows/collect-prices.yml` — full-market snapshot every 30 minutes during trading hours, with forced close-price runs at 15:10 / 15:40
+- `.github/workflows/collect-dividends.yml` — dividends and fundamentals daily after market close
 
-A one-time manual full historical backfill run is needed before launch (see "What to do next" below).
+If `Collect Stock Prices` was disabled, open **Actions → Collect Stock Prices →
+Enable workflow** (or run `gh workflow enable collect-prices.yml`).
+
+A one-time manual full historical backfill is needed before launch: run the
+dividend workflow with `mode=backfill`, and the price workflow with
+`mode=backfill` until `system_settings.price_backfill_completed_at` is set.
+See [docs/collector-fix-notes.md](./docs/collector-fix-notes.md) for details.
 
 ## Known Limitations
 

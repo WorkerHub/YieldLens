@@ -42,10 +42,14 @@ def infer_exchange(code: str) -> str:
 
     Based on standard A-share code range conventions:
     - 60xxxx, 68xxxx (STAR market), 90xxxx -> Shanghai
-    - 8xxxxx, 4xxxxx -> Beijing Stock Exchange
+    - 8xxxxx, 4xxxxx, 920xxx -> Beijing Stock Exchange
     - everything else (00xxxx, 30xxxx, 20xxxx) -> Shenzhen
     """
     code = normalize_ticker(code)
+    # 920xxx is the Beijing exchange code range introduced in 2024; it must be
+    # checked before the generic 9xxxxx -> Shanghai rule.
+    if code.startswith("920"):
+        return "BJ"
     if code.startswith(("6", "9")):
         return "SH"
     if code.startswith(("8", "4")):

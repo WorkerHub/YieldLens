@@ -1,18 +1,32 @@
 name: Collect Dividends and Fundamentals
 
-# Runs once daily after A-share market close. Dividend announcements change
-# rarely (see PRD.md section 3 "更新频率"), so daily batch collection is
-# sufficient — no need to match the price collector's intraday frequency.
+# Runs once daily after the A-share close. "daily" mode covers the three most
+# recently disclosed report periods; "backfill" mode covers ~10 years and is
+# only started manually from the Actions tab.
 on:
   schedule:
     - cron: "0 8 * * 1-5"   # 16:00 CST, weekdays
     - cron: "0 8 * * 6,0"   # also run weekends to catch weekend announcements
   workflow_dispatch:
     inputs:
+      mode:
+        description: "daily = last 3 disclosed periods; backfill = first full history load"
+        type: choice
+        options:
+          - daily
+          - backfill
+        default: daily
       backfill_periods:
-        description: "Number of historical report periods to backfill (each period is one bulk API call covering the whole market). Default 1 for incremental daily runs; use ~20 for the initial 10-year backfill."
+        description: "Only for backfill mode: number of report periods (20 = ~10 years)"
         required: false
-        default: "1"
+        default: "20"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: collect-dividends
+  cancel-in-progress: false
 
 jobs:
   collect:
@@ -36,5 +50,8 @@ jobs:
           CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TABLE_PREFIX: ${{ vars.TABLE_PREFIX }}
-          BACKFILL_PERIODS: ${{ github.event.inputs.backfill_periods || '1' }}
+          COLLECT_MODE: ${{ github.event.inputs.mode || 'daily' }}
+          # Only inject the backfill window in backfill mode; an empty value
+          # keeps daily runs from logging a misleading "ignores ..." message.
+          BACKFILL_PERIODS: ${{ github.event.inputs.mode == 'backfill' && (github.event.inputs.backfill_periods || '20') || '' }}
         run: python collect_dividends.py

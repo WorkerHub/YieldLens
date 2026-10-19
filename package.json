@@ -14,7 +14,10 @@
     "build:web": "pnpm --filter web build",
     "build:worker": "pnpm --filter worker build",
     "deploy": "pnpm build:web && sed -i '' \"s/__APP_VERSION__/'$(node -p \"require('./package.json').version\")'/g\" worker/wrangler.toml && cd worker && pnpm deploy && git checkout -- wrangler.toml",
-    "typecheck": "pnpm --filter web typecheck && pnpm --filter worker typecheck"
+    "typecheck": "pnpm --filter web typecheck && pnpm --filter worker typecheck",
+    "test": "pnpm test:worker && pnpm test:python",
+    "test:worker": "pnpm --filter worker test",
+    "test:python": "cd python-collector && python -m unittest discover -s tests"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.0",
