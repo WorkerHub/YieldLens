@@ -25,7 +25,7 @@
 | B-06 TABLE_PREFIX | 已修复 | 建表/seed/迁移统一由 `worker/scripts/build-sql.mjs` 生成；运行时规则同步收紧；非空前缀实测通过 |
 | 上游接口容错 | 已修复 | 指数退避重试；股票列表三级兜底；单只股票失败跳过并汇总；日志记录原因与尝试次数 |
 | 股价任务从未触发 | 已查明并修复 | GitHub 上该 workflow 状态为 `disabled_manually`（2026-07-20 被手动禁用），已重新启用 |
-| 测试与本地端到端 | 已完成 | 74 个 Python 单元测试 + SQLite 本地端到端脚本 + Node 前缀测试 |
+| 测试与本地端到端 | 已完成 | 86 个 Python 单元测试 + SQLite 本地端到端脚本 + Node 前缀测试 |
 
 ---
 
@@ -71,7 +71,11 @@
 - `COLLECT_MODE=daily|backfill`：
   - `daily` 固定 3 个报告期，忽略 `BACKFILL_PERIODS` 并打印提示；
   - `backfill` 使用 `BACKFILL_PERIODS`（默认 20，约 10 年）。
-- workflow 的 `workflow_dispatch` 增加 `mode` 选择，避免默认值误用。
+- workflow 的 `workflow_dispatch` 增加 `mode` 选择，避免默认值误用；
+  `BACKFILL_PERIODS` 只在 `mode=backfill` 时注入，日常运行不再打印误导性提示。
+- 上游异常不再被 `collect_dividends_for_period()` 吞掉：`main()` 逐报告期计数，
+  全部报告期失败时写 `system_settings.collect_dividends_last_failure` 并
+  `sys.exit(1)`，不再用旧数据重算收益率后“假绿”。
 
 **测试**（`tests/test_report_periods.py`）：
 
@@ -96,6 +100,8 @@
   `to_float()`；送转缺失写 0.0；`parse_dividend_status()` 对非字符串（NaN）
   返回 `proposal`。
 - 价格：开高低收、成交量/额全部清洗；`close <= 0` 的行跳过。
+- 成交量单位统一为**股**：快照接口的 `成交量` 是“手”，写入前 ×100；逐股日线
+  本身就是股。否则同一列会因运行模式相差 100 倍。
 - 基本面：总市值/PE/PB 全部清洗。
 - `D1Client.execute_sql()` 在序列化前检查每个参数，NaN/Inf 抛
   `D1ParamError`，错误信息包含参数下标和 SQL 前缀。
@@ -103,7 +109,8 @@
 **测试**：
 
 - `tests/test_dividend_cleaning.py`：NaN 送转 → 0.0，NaN 状态 → proposal，
-  Timestamp 日期 → `YYYY-MM-DD`，无现金分红行跳过，上游失败不中断；
+  Timestamp 日期 → `YYYY-MM-DD`，无现金分红行跳过；上游失败向上抛出，由
+  `main()` 计数并在全部报告期失败时退出非 0；
 - `tests/test_d1_client.py`：NaN/Inf 在 HTTP 之前被拒绝；
 - `tests/test_common_utils.py`：数值/日期清洗边界。
 
@@ -131,6 +138,9 @@ NaN/Inf 的内存替身）：上游 3651 行 → 清洗后写入 **3620 行**（
 - `stocks.last_price` / `price_updated_at` 只在拿到“今天”的行情时更新；
   没有今日行情（停牌/节假日）不会伪造更新时间。
 - 09:30 前不写快照，避免把昨收当成今日行情；非交易日（含节假日）直接跳过。
+- 交易日历优先从新浪获取，并缓存到 `system_settings.trading_calendar`。上游
+  和缓存都不可用时 **fail closed**：跳过 snapshot/close 并写
+  `collect_prices_last_failure`，不再用“工作日”猜测写节假日行情。
 - `resolve_price_mode()`：`auto` 在 15:05（北京时间）后自动切到 `close`。
 - workflow 增加 15:10、15:40 两次收盘运行。
 
@@ -138,8 +148,10 @@ NaN/Inf 的内存替身）：上游 3651 行 → 清洗后写入 **3620 行**（
 
 - watermark 等于今天时仍然重抓，`start_date = today - 5 天`；
 - 快照写入今日 OHLC 并更新 `last_price`；
-- NaN/Inf 的 OHLC 清洗为 `None`；
-- 14:00 → snapshot，15:10 → close。
+- NaN/Inf 的 OHLC 清洗为 `None`；快照成交量“手”×100 后与日线“股”同量级；
+- 14:00 → snapshot，15:10 → close；
+- 交易日历上游失败但 D1 有缓存时继续；无缓存时 `is_trading_day()` 返回
+  `None`，snapshot/close 跳过、写失败标记并退出非 0，不会伪造节假日行情。
 
 **端到端验收**：`tools/local_e2e.py` 在 `PRICE_MODE=close` 下运行后，
 `stocks.last_price` 等于快照收盘价（600519=1500.0、000001=11.2、000002=8.4），
@@ -155,19 +167,40 @@ job 上限。
 - **主路径**：`ak.stock_zh_a_spot_em()` 一次返回全市场快照，写入当日
   `stock_prices` 并批量刷新 `stocks.last_price`。5000 只股票只需 1 次上游调用；
   D1 写入按 100 参数上限分批（`stock_prices` 8 列 → 12 行/语句，
-  `stocks` 更新 → 33 行/语句）。
+  `stocks` 更新（1 个值列 + 2 个静态列）→ 32 行/语句）。
 - **回退/回填**：保留逐股 `stock_zh_a_daily`，但：
   - `history` 模式：每日游标 `price_history_cursor:<date>`，默认 600 只/片；
-  - `backfill` 模式：持久游标 `price_backfill_cursor`，默认 300 只/片；
-  - 每片处理完写 `price_history_progress` / `price_backfill_progress`；
+  - `backfill` 模式：持久游标 `price_backfill_cursor`，默认 **30 只/片**
+    （10 年约 2400 根日线/只，8 列 → 12 行/语句，约 200 次 D1 请求/只；
+    30 只约 5–8 分钟，给 25 分钟上限留足余量）；
+  - 每处理 **10 只** checkpoint 一次游标和进度，并设 **18 分钟软截止**；
+    到点主动停止并保存游标，Actions SIGTERM 时最多丢最后不到 10 只；
   - 下一片从游标继续，支持断点续跑；
-  - 单只失败只计数并跳过，失败率 > 20% 时任务退出非 0，Actions 标红。
-- workflow 增加 `concurrency`，避免上一轮未结束下一轮重叠。
-- 旧的 `BACKFILL_BATCH` 分片方式仍兼容，但新配置推荐游标。
+  - 单只失败只计数并跳过，失败代码写入 `failed_codes`；失败率 > 20% 时
+    游标回退到第一只失败股票之前，下一轮重试，并退出非 0 让 Actions 标红；
+  - 不再保留旧的 `BACKFILL_BATCH` 切片，避免它与全局游标互相冲突。
+- workflow 增加 `concurrency`，避免上一轮未结束下一轮重叠；`mode=backfill`
+  时默认片大小自动用 30，`history` 用 600。
 
 **覆盖进度**：快照模式写 `price_snapshot_progress`；逐股模式写
 `price_history_progress` / `price_backfill_progress`，包含日期、模式、已处理数、
-总数、本片大小、成功/失败数、是否完成。
+总数、本片大小、成功/失败数、`failed_codes`、停止原因和是否完成。
+
+### 收益率重算的续跑（H-09 的采集侧缓解）
+
+**问题**：回填后每只股票会返回约 2400 行价格，5000 只股票 × 多次 D1 请求，
+55 分钟分红 job 很可能跑不完；旧逻辑没有游标，超时后从第一只重来。
+
+**改动**（`python-collector/collect_dividends.py`）：
+
+- `run_yield_recompute()`：默认 500 只/片、40 分钟软截止、每 20 只 checkpoint；
+- 游标 `yield_recompute_cursor`、进度 `yield_recompute_progress` 写入
+  `system_settings`；完成时写 `yield_recompute_completed_at`；
+- 只对 `status='implemented'` 的股票重算，减少无效请求；
+- 单只失败只记录并继续，`failed_codes` 写入进度。
+
+这仍是逐股 N+1 实现（H-09 的 SQL 批量化留待下一轮），但不会再“永远从第一只
+开始”。
 
 ### B-06 TABLE_PREFIX 一致性
 
@@ -304,12 +337,16 @@ python -m unittest discover -s tests
 结果：
 
 ```text
-Ran 74 tests in 0.018s
+Ran 86 tests in 0.03s
 OK
 ```
 
-覆盖：D1 参数上限、NaN/Inf、报告期、收盘价覆盖、分片游标、股票列表兜底、
-重试次数、前缀规范化、920 代码段。
+> unittest 的 “Ran … in …” 只统计测试执行时间，不包含导入 pandas/akshare 的
+> 时间；整条命令的实际耗时约 1 秒。
+
+覆盖：D1 参数上限、NaN/Inf、报告期、收盘价覆盖、分片 checkpoint/软截止、
+失败游标回退、收益率重算续跑、交易日历 fail-closed、股票列表兜底、重试次数、
+前缀规范化、920 代码段。
 
 ### 4.3 本地端到端（SQLite 模拟 D1，无 Cloudflare 凭证）
 
@@ -324,16 +361,22 @@ python tools/local_e2e.py
 local e2e OK
   prefix tables : yl_dividend_yields, yl_dividends, yl_stock_prices, yl_stocks, yl_system_settings
   stocks        : 3
-  price rows    : 3 (close={'600519': 1500.0, '000001': 11.2, '000002': 8.4})
+  price rows    : 7 (close={'600519': 1500.0, '000001': 11.2, '000002': 8.4})
   dividends     : 6 (latest report period 2026-06-30)
   yield rows    : 1
-  snapshot calls: 4; per-stock history calls: 0
+  intraday 1490 -> close 1500 overwrite: OK
+  volume unit   : snapshot=1000.0, daily=1000.0 shares
+  backfill cursor: 000002 after 2 one-stock runs
+  snapshot calls: 8; per-stock history calls: 2
   stock-list fallback: primary reset -> Eastmoney snapshot -> D1 rows
 ```
 
-该脚本使用真实的 `D1Client.upsert_rows()` / `update_rows()` 批处理与参数校验，
-只是把 HTTP 换成内存 SQLite；因此同时验证了 B-01、B-03、B-04、B-05、B-06、
-报告期选择、股票列表兜底和 NaN 清洗。
+该脚本使用真实的 `D1Client.upsert_rows()` / `update_rows()` 批处理，并在
+`LocalD1.execute_sql()` 内显式调用 `_validate_params()`，所以 100 参数上限和
+NaN/Inf 拒绝在 e2e 中也会真实执行；只是把 HTTP 换成内存 SQLite。日期固定为
+2026-10-19 注入 `main(today=...)`，不再依赖运行当天。脚本覆盖 B-01、B-03、
+B-04（盘中 1490 → 收盘 1500）、B-05（快照 + backfill 游标续跑）、B-06、报告期
+选择、成交量单位、股票列表兜底和 NaN 清洗。
 
 ### 4.4 前缀迁移/seed 验证
 
@@ -406,7 +449,8 @@ TABLE_PREFIX=yl pnpm db:migrate:remote   # 示例；不设前缀则用 wrangler.
 1. **分红/基本面**：GitHub Actions → **Collect Dividends and Fundamentals** →
    **Run workflow** → `mode=backfill`，`backfill_periods=20`。
 2. **股价历史**：GitHub Actions → **Collect Stock Prices** →
-   **Run workflow** → `mode=backfill`，`batch_size=300`。重复运行直到
+   **Run workflow** → `mode=backfill`，`batch_size` 留空即用 30 只/片。
+   每轮在 18 分钟软截止或处理完当前片后保存游标，重复运行直到
    `system_settings.price_backfill_completed_at` 有值（每次从游标继续）。
 3. 日常：两个 workflow 恢复 `daily` / `auto` 即可；价格任务在交易时段每 30 分钟
    跑一次快照，15:10 / 15:40 跑收盘覆盖。
@@ -425,11 +469,11 @@ WHERE code = '600519' AND trade_date = date('now', '+8 hours');
 
 -- 采集进度/游标
 SELECT key, value FROM yl_system_settings
-WHERE key LIKE 'price_%' OR key LIKE 'collect_%';
+WHERE key LIKE 'price_%' OR key LIKE 'yield_%' OR key LIKE 'collect_%' OR key = 'trading_calendar';
 ```
 
 `price_snapshot_progress` / `price_history_progress` /
-`price_backfill_progress` 可用来判断覆盖是否完成。
+`price_backfill_progress` / `yield_recompute_progress` 可用来判断覆盖是否完成。
 
 ---
 
@@ -437,8 +481,9 @@ WHERE key LIKE 'price_%' OR key LIKE 'collect_%';
 
 - **股息率口径未改**：静态股息率的完整财年口径（H-01）、连续分红年数（H-03）、
   历史序列按事件打点（H-02）仍按原逻辑，留待下一轮。
-- **分红重算仍是逐股 N+1**（H-09）：首次 10 年回填 + 全市场重算可能接近
-  55 分钟上限；本轮未重构为 SQL 批量计算，建议下一轮单独处理。
+- **分红重算仍是逐股 N+1**（H-09）：本轮已加 `yield_recompute_cursor`、
+  500 只/片、40 分钟软截止和每 20 只 checkpoint，不会因超时永远从头开始；
+  但 SQL 批量化仍未做，首次全量回填后的收益率重算需要分多天完成。
 - **快照接口依赖东方财富**：若 `stock_zh_a_spot_em()` 不可用，会回退到逐股
   分片；此时当日全市场覆盖需要多次运行完成，进度见 `price_history_progress`。
 - **盘中快照语义**：主路径在盘中写入的是实时快照价；收盘 15:10 / 15:40 会强制

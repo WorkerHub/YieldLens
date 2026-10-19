@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -45,16 +46,20 @@ from common.settings import get_setting, set_json_setting, set_setting
 from common.stock_list import sync_stock_list
 from common.table_prefix import get_table_prefix
 from common.ticker_utils import code_to_akshare_daily_prefix, normalize_ticker
-from common.trading_calendar import is_trading_day
+from common.trading_calendar import is_trading_day, load_trading_calendar
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("collect_prices")
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 BACKFILL_YEARS = 10
-BACKFILL_TOTAL_BATCHES = 50
 DEFAULT_HISTORY_BATCH_SIZE = 600
-DEFAULT_BACKFILL_BATCH_SIZE = 300
+# ~2400 bars/stock -> ~200 D1 requests/stock; 30 stocks is ~5-8 minutes and
+# leaves ample room under the 25-minute job timeout. The soft deadline below
+# stops the shard even earlier if the upstream is slow.
+DEFAULT_BACKFILL_BATCH_SIZE = 30
+SHARD_DEADLINE_SECONDS = 18 * 60
+CHECKPOINT_EVERY = 10
 STOCKS_PER_LOG = 50
 MAX_FAILURE_RATE = 0.2
 MARKET_OPEN_HOUR = 9
@@ -163,6 +168,11 @@ def _price_row_from_snapshot(record, code: str, trade_date: str) -> dict | None:
     close = to_float(record.get("最新价"))
     if close is None or close <= 0:
         return None
+    # stock_zh_a_spot_em() reports 成交量 in 手 (lots of 100 shares), while
+    # stock_zh_a_daily() reports shares. Normalise to shares so the same
+    # stock_prices.volume column means the same thing in every mode.
+    volume_lots = to_float(record.get("成交量"))
+    volume = volume_lots * 100 if volume_lots is not None else None
     return {
         "code": code,
         "trade_date": trade_date,
@@ -170,7 +180,7 @@ def _price_row_from_snapshot(record, code: str, trade_date: str) -> dict | None:
         "high": to_float(record.get("最高")),
         "low": to_float(record.get("最低")),
         "close": close,
-        "volume": to_float(record.get("成交量")),
+        "volume": volume,
         "amount": to_float(record.get("成交额")),
     }
 
@@ -243,6 +253,7 @@ def collect_one_stock(
     prefix: str,
     code: str,
     backfill_mode: bool,
+    today: date | None = None,
 ) -> bool:
     """Fetch one stock's daily bars. Returns False only on an upstream failure.
 
@@ -250,25 +261,25 @@ def collect_one_stock(
     gone: every run re-fetches a small overlap that always includes today, so
     an intraday snapshot cannot block the post-close correction.
     """
-    today = beijing_today()
+    target_today = today or beijing_today()
 
     if backfill_mode:
-        start_date = today - timedelta(days=365 * BACKFILL_YEARS)
+        start_date = target_today - timedelta(days=365 * BACKFILL_YEARS)
     else:
         watermark = get_watermark(d1, prefix, code)
         if watermark:
             try:
                 watermark_date = date.fromisoformat(watermark[:10])
             except ValueError:
-                watermark_date = today - timedelta(days=365)
-            start_date = min(today, watermark_date - timedelta(days=5))
+                watermark_date = target_today - timedelta(days=365)
+            start_date = min(target_today, watermark_date - timedelta(days=5))
         else:
             # No history yet: one year is enough for the detail chart; the
             # dedicated backfill mode fills the full decade.
-            start_date = today - timedelta(days=365)
+            start_date = target_today - timedelta(days=365)
 
     try:
-        df = fetch_ohlcv(code, start_date.strftime("%Y%m%d"), today.strftime("%Y%m%d"))
+        df = fetch_ohlcv(code, start_date.strftime("%Y%m%d"), target_today.strftime("%Y%m%d"))
     except Exception as exc:  # noqa: BLE001 - one stock must not abort the batch
         log.warning("%s: OHLCV fetch failed, skipping: %s", code, exc)
         return False
@@ -285,7 +296,7 @@ def collect_one_stock(
     d1.upsert_rows(f"{prefix}stock_prices", rows)
 
     latest = rows[-1]
-    if latest["trade_date"] == today.isoformat():
+    if latest["trade_date"] == target_today.isoformat():
         now = utc_now_iso()
         d1.execute_sql(
             f"UPDATE {prefix}stocks SET last_price = ?, price_updated_at = ?, updated_at = ? WHERE code = ?",
@@ -304,6 +315,23 @@ def _cursor_start(codes: list[str], cursor: str | None) -> int:
         return 0
 
 
+def _checkpoint_history(
+    d1: D1Client,
+    prefix: str,
+    cursor_key: str,
+    progress_key: str,
+    progress: dict,
+    now: str,
+) -> None:
+    """Persist the cursor + partial progress mid-shard.
+
+    Called every ``CHECKPOINT_EVERY`` stocks and whenever the soft deadline is
+    reached, so an Actions SIGTERM never loses the whole shard.
+    """
+    set_setting(d1, prefix, cursor_key, progress["cursor"], now)
+    set_json_setting(d1, prefix, progress_key, progress, now)
+
+
 def run_sharded_history(
     d1: D1Client,
     prefix: str,
@@ -312,9 +340,20 @@ def run_sharded_history(
     mode: str,
     batch_size: int,
     today: date | None = None,
+    deadline_seconds: int = SHARD_DEADLINE_SECONDS,
+    checkpoint_every: int = CHECKPOINT_EVERY,
+    max_failure_rate: float = MAX_FAILURE_RATE,
+    monotonic=time.monotonic,
 ) -> dict:
-    """Process one shard of the per-stock history fallback, with a cursor."""
-    target_day = (today or beijing_today()).isoformat()
+    """Process one shard of the per-stock history fallback, with a cursor.
+
+    The shard stops at ``deadline_seconds`` (default 18 minutes) even if it has
+    not exhausted ``batch_size``, and checkpoints the cursor every
+    ``checkpoint_every`` stocks. A job killed by the Actions timeout therefore
+    resumes at the last checkpoint instead of restarting the shard.
+    """
+    target_today = today or beijing_today()
+    target_day = target_today.isoformat()
     is_backfill = mode == "backfill"
     cursor_key = "price_backfill_cursor" if is_backfill else f"price_history_cursor:{target_day}"
     progress_key = "price_backfill_progress" if is_backfill else "price_history_progress"
@@ -326,17 +365,37 @@ def run_sharded_history(
         start = 0
         cursor = None
     batch = codes[start : start + max(1, batch_size)]
+    started_at = monotonic()
 
+    processed = 0
     success = 0
     failure = 0
+    failed_codes: list[str] = []
+    last_code: str | None = None
+    stopped_reason = "completed"
+
     for index, code in enumerate(batch, start=1):
+        if monotonic() - started_at >= deadline_seconds:
+            stopped_reason = "deadline"
+            log.warning(
+                "%s soft deadline (%ss) reached after %d stocks; saving cursor",
+                mode,
+                deadline_seconds,
+                processed,
+            )
+            break
         try:
-            ok = collect_one_stock(d1, prefix, code, is_backfill)
+            ok = collect_one_stock(d1, prefix, code, is_backfill, today=target_today)
         except Exception as exc:  # noqa: BLE001 - one stock must not abort the shard
             log.warning("%s: collection failed, skipping: %s", code, exc)
             ok = False
         success += int(ok)
         failure += int(not ok)
+        if not ok:
+            failed_codes.append(code)
+        last_code = code
+        processed += 1
+
         if index % STOCKS_PER_LOG == 0:
             log.info(
                 "%s progress: %d/%d in this shard (%d failures so far)",
@@ -345,34 +404,76 @@ def run_sharded_history(
                 len(batch),
                 failure,
             )
+        if processed % checkpoint_every == 0:
+            checkpoint = {
+                "date": target_day,
+                "mode": mode,
+                "processed": start + processed,
+                "total": len(codes),
+                "shard_start": start,
+                "shard_size": len(batch),
+                "success": success,
+                "failure": failure,
+                "failed_codes": failed_codes,
+                "completed": False,
+                "stopped_reason": "running",
+                "cursor": code,
+                "updated_at": utc_now_iso(),
+            }
+            _checkpoint_history(d1, prefix, cursor_key, progress_key, checkpoint, utc_now_iso())
 
-    completed = start + len(batch) >= len(codes)
-    next_cursor = "" if completed else batch[-1]
-    set_setting(d1, prefix, cursor_key, next_cursor, now)
+    checked = success + failure
+    failure_rate = (failure / checked) if checked else 0.0
+    failure_rate_exceeded = checked > 0 and failure_rate > max_failure_rate
+    if stopped_reason == "completed" and start + processed < len(codes):
+        stopped_reason = "shard_done"
+    completed = (start + processed >= len(codes)) and stopped_reason != "deadline"
+    if failure_rate_exceeded:
+        # Do not skip the failed codes: roll the cursor back to the code before
+        # the first failure so the next run retries that slice.
+        stopped_reason = "failure_rate"
+        completed = False
+        first_failed = batch.index(failed_codes[0]) if failed_codes else 0
+        retry_index = start + first_failed
+        next_cursor = codes[retry_index - 1] if retry_index > 0 else ""
+    elif completed:
+        next_cursor = ""
+    elif last_code:
+        next_cursor = last_code
+    else:
+        next_cursor = codes[start - 1] if start > 0 else ""
+
     progress = {
         "date": target_day,
         "mode": mode,
-        "processed": start + len(batch),
+        "processed": start + processed,
         "total": len(codes),
         "shard_start": start,
         "shard_size": len(batch),
         "success": success,
         "failure": failure,
+        "failure_rate": round(failure_rate, 4),
+        "failure_rate_exceeded": failure_rate_exceeded,
+        "failed_codes": failed_codes,
         "completed": completed,
+        "stopped_reason": stopped_reason,
+        "cursor": next_cursor,
+        "deadline_seconds": deadline_seconds,
         "updated_at": now,
     }
-    set_json_setting(d1, prefix, progress_key, progress, now)
+    _checkpoint_history(d1, prefix, cursor_key, progress_key, progress, now)
     if is_backfill and completed:
         set_setting(d1, prefix, "price_backfill_completed_at", now, now)
 
     log.info(
-        "%s shard done: %d/%d processed, %d ok, %d failed, completed=%s",
+        "%s shard done: %d/%d processed, %d ok, %d failed, completed=%s, reason=%s",
         mode,
-        start + len(batch),
+        start + processed,
         len(codes),
         success,
         failure,
         completed,
+        stopped_reason,
     )
     return progress
 
@@ -383,23 +484,14 @@ def _record_failure(d1: D1Client, prefix: str, message: str) -> None:
     log.error(message)
 
 
-def _legacy_batch_slice(codes: list[str]) -> list[str]:
-    raw = os.environ.get("BACKFILL_BATCH")
-    if raw is None or raw.strip() == "":
-        return codes
-    total = int(os.environ.get("BACKFILL_TOTAL_BATCHES", str(BACKFILL_TOTAL_BATCHES)))
-    index = int(raw)
-    if total <= 0 or index < 0 or index >= total:
-        raise ValueError(f"Invalid BACKFILL_BATCH={index} for {total} batches")
-    return [code for i, code in enumerate(codes) if i % total == index]
-
-
-def main() -> None:
+def main(today: date | None = None) -> None:
     prefix = get_table_prefix()
     d1 = D1Client()
+    target_today = today or beijing_today()
+    current = beijing_now()
 
-    mode = resolve_price_mode()
-    log.info("Price collection mode: %s (Beijing time %s)", mode, beijing_now().isoformat())
+    mode = resolve_price_mode(now=current)
+    log.info("Price collection mode: %s (Beijing time %s)", mode, current.isoformat())
 
     sync_stock_list(d1, prefix, log)
 
@@ -410,16 +502,27 @@ def main() -> None:
     log.info("Loaded %d A-share codes", len(codes))
 
     if mode in {"snapshot", "close"}:
-        current = beijing_now()
-        if not is_trading_day(current.date(), log):
-            log.info("Not a trading day; snapshot collection skipped")
+        if target_today.weekday() >= 5:
+            log.info("Weekend; snapshot collection skipped")
             return
-        if (current.hour, current.minute) < (MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE):
+        calendar = load_trading_calendar(d1, prefix, log)
+        trading_day = is_trading_day(target_today, log, calendar)
+        if trading_day is None:
+            _record_failure(
+                d1,
+                prefix,
+                "Trading calendar unavailable; snapshot/close skipped (fail closed)",
+            )
+            sys.exit(1)
+        if not trading_day:
+            log.info("%s is not a trading day; snapshot collection skipped", target_today)
+            return
+        if today is None and (current.hour, current.minute) < (MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE):
             log.info("Before the 09:30 open; snapshot collection skipped to avoid stamping yesterday's close as today")
             return
         try:
             df = fetch_spot_snapshot()
-            stats = write_spot_snapshot(d1, prefix, df)
+            stats = write_spot_snapshot(d1, prefix, df, trade_date=target_today)
             now = utc_now_iso()
             set_json_setting(
                 d1,
@@ -437,28 +540,36 @@ def main() -> None:
                 now,
             )
             if mode == "close":
-                set_setting(d1, prefix, "price_close_date", beijing_today().isoformat(), now)
+                set_setting(d1, prefix, "price_close_date", target_today.isoformat(), now)
             return
         except Exception as exc:  # noqa: BLE001 - degrade to sharded per-stock mode
             log.error("Snapshot mode failed (%s); falling back to sharded history mode", exc)
             mode = "history"
 
-    if mode == "backfill":
-        codes = _legacy_batch_slice(codes)
-        default_batch = DEFAULT_BACKFILL_BATCH_SIZE if os.environ.get("BACKFILL_BATCH") is None else len(codes)
-    else:
-        default_batch = DEFAULT_HISTORY_BATCH_SIZE
-    batch_size = int(os.environ.get("PRICE_BATCH_SIZE", str(default_batch)))
+    default_batch = DEFAULT_BACKFILL_BATCH_SIZE if mode == "backfill" else DEFAULT_HISTORY_BATCH_SIZE
+    raw_batch = os.environ.get("PRICE_BATCH_SIZE", "").strip()
+    batch_size = int(raw_batch) if raw_batch else default_batch
     if batch_size <= 0:
         batch_size = default_batch
+    deadline_seconds = int(
+        os.environ.get("PRICE_SHARD_DEADLINE_SECONDS", str(SHARD_DEADLINE_SECONDS))
+    )
 
-    progress = run_sharded_history(d1, prefix, codes, mode=mode, batch_size=batch_size)
-    checked = progress["success"] + progress["failure"]
-    if checked and progress["failure"] / checked > MAX_FAILURE_RATE:
+    progress = run_sharded_history(
+        d1,
+        prefix,
+        codes,
+        mode=mode,
+        batch_size=batch_size,
+        today=target_today,
+        deadline_seconds=deadline_seconds,
+    )
+    if progress["failure_rate_exceeded"]:
         _record_failure(
             d1,
             prefix,
-            f"{progress['failure']}/{checked} stocks failed in {mode} mode on {progress['date']}",
+            f"{progress['failure']}/{progress['success'] + progress['failure']} stocks failed in "
+            f"{mode} mode on {progress['date']}; failed_codes={progress['failed_codes'][:20]}",
         )
         sys.exit(1)
 

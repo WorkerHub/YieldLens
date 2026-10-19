@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,10 +43,11 @@ os.environ["PRICE_MODE"] = "close"
 
 import collect_dividends  # noqa: E402
 import collect_prices  # noqa: E402
-from common.d1_client import D1Client  # noqa: E402
+from common.d1_client import D1Client, _validate_params  # noqa: E402
 
 PREFIX = "yl_"
-EXPECTED_LATEST_PERIOD = "2026-06-30"  # report_period for today=2026-10-19
+FIXED_TODAY = date(2026, 10, 19)
+EXPECTED_LATEST_PERIOD = "2026-06-30"
 
 
 class LocalD1(D1Client):
@@ -56,7 +57,10 @@ class LocalD1(D1Client):
         self.connection = connection
 
     def execute_sql(self, sql: str, params=None):
-        cursor = self.connection.execute(sql, list(params or []))
+        # Exercise the same pre-flight checks as the real client: >100 bound
+        # parameters and NaN/Inf must fail before SQLite sees the statement.
+        values = _validate_params(params or [], sql=sql)
+        cursor = self.connection.execute(sql, values)
         rows = []
         if cursor.description:
             columns = [description[0] for description in cursor.description]
@@ -71,12 +75,40 @@ def _schema_sql() -> str:
     return schema.replace("{prefix}", PREFIX)
 
 
-def _snapshot_frame(today):
+def _snapshot_frame(today, close_600519: float):
+    # 成交量 is in 手 (lots); the collector must multiply by 100 to shares.
     return pd.DataFrame(
         [
-            {"代码": "600519", "名称": "贵州茅台", "最新价": 1500.0, "今开": 1490.0, "最高": 1510.0, "最低": 1480.0, "成交量": 1000.0, "成交额": 1_500_000.0, "总市值": 1_900_000_000_000.0, "市盈率-动态": 20.0, "市净率": 8.0},
-            {"代码": "000001", "名称": "平安银行", "最新价": 11.2, "今开": 11.0, "最高": 11.3, "最低": 10.9, "成交量": 2000.0, "成交额": 22_400.0, "总市值": 220_000_000_000.0, "市盈率-动态": 5.0, "市净率": 0.6},
-            {"代码": "000002", "名称": "万科A", "最新价": 8.4, "今开": 8.3, "最高": 8.5, "最低": 8.2, "成交量": 3000.0, "成交额": 25_200.0, "总市值": 100_000_000_000.0, "市盈率-动态": float("nan"), "市净率": 0.4},
+            {"代码": "600519", "名称": "贵州茅台", "最新价": close_600519, "今开": 1490.0, "最高": 1510.0, "最低": 1480.0, "成交量": 10.0, "成交额": 1_500_000.0, "总市值": 1_900_000_000_000.0, "市盈率-动态": 20.0, "市净率": 8.0},
+            {"代码": "000001", "名称": "平安银行", "最新价": 11.2, "今开": 11.0, "最高": 11.3, "最低": 10.9, "成交量": 20.0, "成交额": 22_400.0, "总市值": 220_000_000_000.0, "市盈率-动态": 5.0, "市净率": 0.6},
+            {"代码": "000002", "名称": "万科A", "最新价": 8.4, "今开": 8.3, "最高": 8.5, "最低": 8.2, "成交量": 30.0, "成交额": 25_200.0, "总市值": 100_000_000_000.0, "市盈率-动态": float("nan"), "市净率": 0.4},
+        ]
+    )
+
+
+def _history_frame():
+    # Past dates only, so the backfill smoke run cannot overwrite today's
+    # snapshot close. Volume is already in shares, matching the daily API.
+    return pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2026-10-16"),
+                "open": 99.0,
+                "high": 101.0,
+                "low": 98.0,
+                "close": 100.0,
+                "volume": 1000.0,
+                "amount": 100_000.0,
+            },
+            {
+                "date": pd.Timestamp("2026-10-17"),
+                "open": 100.0,
+                "high": 102.0,
+                "low": 99.0,
+                "close": 101.0,
+                "volume": 1000.0,
+                "amount": 101_000.0,
+            },
         ]
     )
 
@@ -92,19 +124,25 @@ def _dividend_frame(today):
 
 
 def main() -> int:
-    today = collect_prices.beijing_today()
+    today = FIXED_TODAY
     connection = sqlite3.connect(":memory:")
     connection.executescript(_schema_sql())
     local_d1 = LocalD1(connection)
 
-    snapshot = _snapshot_frame(today)
     dividends = _dividend_frame(today)
+    current_snapshot = _snapshot_frame(today, 1490.0)
     snapshot_calls = 0
+    history_calls = 0
 
     def snapshot_side_effect():
         nonlocal snapshot_calls
         snapshot_calls += 1
-        return snapshot
+        return current_snapshot
+
+    def history_side_effect(*_args, **_kwargs):
+        nonlocal history_calls
+        history_calls += 1
+        return _history_frame()
 
     def primary_side_effect():
         raise ConnectionResetError("simulated GitHub runner reset")
@@ -119,7 +157,7 @@ def main() -> int:
         patch("common.stock_list.ak.stock_zh_a_spot_em", side_effect=snapshot_side_effect),
         patch("collect_prices.ak.stock_zh_a_spot_em", side_effect=snapshot_side_effect),
         patch("collect_prices.ak.stock_info_a_code_name", side_effect=primary_side_effect),
-        patch("collect_prices.ak.stock_zh_a_daily", side_effect=AssertionError("history path should not run")),
+        patch.object(collect_prices, "fetch_ohlcv", side_effect=history_side_effect),
         patch("common.trading_calendar.ak.tool_trade_date_hist_sina", return_value=calendar),
         patch("collect_dividends.ak.stock_fhps_em", return_value=dividends),
         patch("collect_dividends.ak.stock_zh_a_spot_em", side_effect=snapshot_side_effect),
@@ -128,10 +166,28 @@ def main() -> int:
     for patcher in patches:
         patcher.start()
     try:
-        print("== price collector (close mode, bulk snapshot) ==")
-        collect_prices.main()
+        print("== price collector (intraday snapshot, close=1490) ==")
+        os.environ["PRICE_MODE"] = "snapshot"
+        current_snapshot = _snapshot_frame(today, 1490.0)
+        collect_prices.main(today=today)
+        intraday_close = connection.execute(
+            "SELECT last_price FROM yl_stocks WHERE code = '600519'"
+        ).fetchone()[0]
+        assert intraday_close == 1490.0, intraday_close
+
+        print("== price collector (close snapshot, close=1500) ==")
+        os.environ["PRICE_MODE"] = "close"
+        current_snapshot = _snapshot_frame(today, 1500.0)
+        collect_prices.main(today=today)
+
         print("== dividend collector (daily, 3 report periods) ==")
-        collect_dividends.main()
+        collect_dividends.main(today=today)
+
+        print("== price backfill smoke (batch=1, cursor resume) ==")
+        os.environ["PRICE_MODE"] = "backfill"
+        os.environ["PRICE_BATCH_SIZE"] = "1"
+        collect_prices.main(today=today)
+        collect_prices.main(today=today)
     finally:
         for patcher in reversed(patches):
             patcher.stop()
@@ -156,7 +212,8 @@ def main() -> int:
     dividend_count = connection.execute("SELECT COUNT(*) FROM yl_dividends").fetchone()[0]
     yield_count = connection.execute("SELECT COUNT(*) FROM yl_dividend_yields").fetchone()[0]
     assert stock_count == 3, stock_count
-    assert price_count == 3, price_count
+    # 3 today rows + 2 past bars for each of the 2 backfill smoke stocks.
+    assert price_count == 7, price_count
     assert dividend_count == 6, dividend_count  # 2 cash-dividend stocks x 3 periods
     # Only 600519 is "implemented"; 000001 has a NaN status -> proposal.
     assert yield_count == 1, yield_count
@@ -187,7 +244,24 @@ def main() -> int:
     )
     assert statuses == {"600519": "implemented", "000001": "proposal"}, statuses
 
-    assert snapshot_calls >= 2, snapshot_calls
+    snapshot_volume = connection.execute(
+        "SELECT volume FROM yl_stock_prices WHERE code = '600519' AND trade_date = ?",
+        (today.isoformat(),),
+    ).fetchone()[0]
+    history_volume = connection.execute(
+        "SELECT volume FROM yl_stock_prices WHERE code = '000001' AND trade_date = '2026-10-16'"
+    ).fetchone()[0]
+    assert snapshot_volume == 1000.0, snapshot_volume  # 10 lots -> 1000 shares
+    assert history_volume == 1000.0, history_volume
+    assert snapshot_volume == history_volume
+
+    backfill_cursor = connection.execute(
+        "SELECT value FROM yl_system_settings WHERE key = 'price_backfill_cursor'"
+    ).fetchone()[0]
+    assert backfill_cursor == "000002", backfill_cursor
+    assert history_calls == 2, history_calls
+
+    assert snapshot_calls >= 4, snapshot_calls
     print()
     print("local e2e OK")
     print(f"  prefix tables : {', '.join(sorted(expected_tables))}")
@@ -195,7 +269,10 @@ def main() -> int:
     print(f"  price rows    : {price_count} (close={expected_prices})")
     print(f"  dividends     : {dividend_count} (latest report period {latest_period})")
     print(f"  yield rows    : {yield_count}")
-    print(f"  snapshot calls: {snapshot_calls}; per-stock history calls: 0")
+    print("  intraday 1490 -> close 1500 overwrite: OK")
+    print(f"  volume unit   : snapshot={snapshot_volume}, daily={history_volume} shares")
+    print(f"  backfill cursor: {backfill_cursor} after 2 one-stock runs")
+    print(f"  snapshot calls: {snapshot_calls}; per-stock history calls: {history_calls}")
     print("  stock-list fallback: primary reset -> Eastmoney snapshot -> D1 rows")
     return 0
 

@@ -118,7 +118,9 @@ python tools/local_e2e.py
 
 Price modes (`PRICE_MODE`): `auto` (full-market snapshot intraday, `close` after
 15:05 Beijing time), `snapshot`, `close`, `history`, `backfill`. Per-stock
-`history`/`backfill` runs are sharded with a cursor in `system_settings`.
+`history`/`backfill` runs are sharded (default 600 history / 30 backfill stocks),
+checkpointed every 10 stocks with an 18-minute soft deadline, and resume from a
+cursor in `system_settings`.
 
 Dividend modes (`COLLECT_MODE`): `daily` (last three disclosed report periods)
 or `backfill` (`BACKFILL_PERIODS`, default 20 periods ≈ 10 years).

@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -39,6 +40,7 @@ from common.d1_client import D1Client
 from common.numeric import clean_date, to_float
 from common.rate_limiter import eastmoney_limiter
 from common.retry import call_with_retries
+from common.settings import get_setting, set_json_setting, set_setting
 from common.stock_list import sync_stock_list
 from common.table_prefix import get_table_prefix
 from common.ticker_utils import normalize_ticker
@@ -50,6 +52,13 @@ BACKFILL_YEARS = 10
 DAILY_REPORT_PERIODS = 3
 VALID_MODES = {"daily", "backfill"}
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+# Yield recompute is a per-stock N+1 read of the full price history, so it is
+# sharded and resumable too: 500 stocks/run with a 40-minute soft deadline
+# leaves ~15 minutes of the 55-minute dividend job for collection + D1 writes.
+DEFAULT_YIELD_BATCH_SIZE = 500
+YIELD_DEADLINE_SECONDS = 40 * 60
+YIELD_CHECKPOINT_EVERY = 20
 
 
 def beijing_today() -> date:
@@ -132,11 +141,10 @@ def fetch_dividend_frame(period: str):
 
 
 def collect_dividends_for_period(d1: D1Client, prefix: str, period: str) -> int:
-    try:
-        df = fetch_dividend_frame(period)
-    except Exception as exc:  # noqa: BLE001 - one period must not abort the run
-        log.warning("stock_fhps_em(%s) failed after retries: %s", period, exc)
-        return 0
+    # Let upstream failures bubble to main(), which counts failed periods and
+    # exits non-zero when every period failed. Returning 0 here would make a
+    # total outage indistinguishable from a genuinely empty report period.
+    df = fetch_dividend_frame(period)
 
     if df is None or df.empty:
         log.info("Report period %s: upstream returned no rows", period)
@@ -363,6 +371,122 @@ def recompute_yields_for_stock(d1: D1Client, prefix: str, code: str) -> None:
     )
 
 
+def _checkpoint_yield_recompute(
+    d1: D1Client,
+    prefix: str,
+    progress: dict,
+    now: str,
+) -> None:
+    set_setting(d1, prefix, "yield_recompute_cursor", progress["cursor"], now)
+    set_json_setting(d1, prefix, "yield_recompute_progress", progress, now)
+
+
+def run_yield_recompute(
+    d1: D1Client,
+    prefix: str,
+    codes: list[str],
+    *,
+    batch_size: int = DEFAULT_YIELD_BATCH_SIZE,
+    deadline_seconds: int = YIELD_DEADLINE_SECONDS,
+    checkpoint_every: int = YIELD_CHECKPOINT_EVERY,
+    monotonic=time.monotonic,
+) -> dict:
+    """Recompute yields for one resumable slice of ``codes``.
+
+    The cursor is persisted every ``checkpoint_every`` stocks and on the soft
+    deadline, so a job timeout does not restart the whole market next day.
+    """
+    now = utc_now_iso()
+    cursor = get_setting(d1, prefix, "yield_recompute_cursor")
+    start = 0
+    if cursor:
+        try:
+            start = codes.index(cursor) + 1
+        except ValueError:
+            log.warning("Yield cursor %s no longer exists; restarting from the top", cursor)
+    if start >= len(codes):
+        start = 0
+    batch = codes[start : start + max(1, batch_size)]
+    started_at = monotonic()
+
+    processed = 0
+    success = 0
+    failure = 0
+    failed_codes: list[str] = []
+    last_code: str | None = None
+    stopped_reason = "completed"
+
+    for code in batch:
+        if monotonic() - started_at >= deadline_seconds:
+            stopped_reason = "deadline"
+            log.warning(
+                "Yield recompute soft deadline (%ss) reached after %d stocks; saving cursor",
+                deadline_seconds,
+                processed,
+            )
+            break
+        try:
+            recompute_yields_for_stock(d1, prefix, code)
+            success += 1
+        except Exception as exc:  # noqa: BLE001 - one stock must not abort the slice
+            failure += 1
+            failed_codes.append(code)
+            log.warning("%s: yield computation failed, skipping: %s", code, exc)
+        last_code = code
+        processed += 1
+        if processed % checkpoint_every == 0:
+            checkpoint = {
+                "processed": start + processed,
+                "total": len(codes),
+                "shard_start": start,
+                "shard_size": len(batch),
+                "success": success,
+                "failure": failure,
+                "failed_codes": failed_codes,
+                "completed": False,
+                "stopped_reason": "running",
+                "cursor": code,
+                "updated_at": utc_now_iso(),
+            }
+            _checkpoint_yield_recompute(d1, prefix, checkpoint, utc_now_iso())
+
+    if stopped_reason == "completed" and start + processed < len(codes):
+        stopped_reason = "shard_done"
+    completed = (start + processed >= len(codes)) and stopped_reason != "deadline"
+    if completed:
+        next_cursor = ""
+    elif last_code:
+        next_cursor = last_code
+    else:
+        next_cursor = codes[start - 1] if start > 0 else ""
+    progress = {
+        "processed": start + processed,
+        "total": len(codes),
+        "shard_start": start,
+        "shard_size": len(batch),
+        "success": success,
+        "failure": failure,
+        "failed_codes": failed_codes,
+        "completed": completed,
+        "stopped_reason": stopped_reason,
+        "cursor": next_cursor,
+        "deadline_seconds": deadline_seconds,
+        "updated_at": now,
+    }
+    _checkpoint_yield_recompute(d1, prefix, progress, now)
+    if completed:
+        set_setting(d1, prefix, "yield_recompute_completed_at", now, now)
+    log.info(
+        "Yield recompute shard done: %d/%d processed, %d ok, %d failed, completed=%s",
+        start + processed,
+        len(codes),
+        success,
+        failure,
+        completed,
+    )
+    return progress
+
+
 def resolve_collect_mode() -> str:
     mode = os.environ.get("COLLECT_MODE", "daily").strip().lower()
     if mode not in VALID_MODES:
@@ -370,19 +494,20 @@ def resolve_collect_mode() -> str:
     return mode
 
 
-def main() -> None:
+def main(today: date | None = None) -> None:
     prefix = get_table_prefix()
     d1 = D1Client()
     mode = resolve_collect_mode()
+    target_today = today or beijing_today()
 
     sync_stock_list(d1, prefix, log)
 
     if mode == "backfill":
-        all_periods = report_periods(BACKFILL_YEARS)
+        all_periods = report_periods(BACKFILL_YEARS, today=target_today)
         requested = int(os.environ.get("BACKFILL_PERIODS", str(len(all_periods))))
         periods = all_periods[: max(1, requested)]
     else:
-        periods = daily_report_periods(DAILY_REPORT_PERIODS)
+        periods = daily_report_periods(DAILY_REPORT_PERIODS, today=target_today)
         if os.environ.get("BACKFILL_PERIODS"):
             log.info(
                 "COLLECT_MODE=daily ignores BACKFILL_PERIODS=%s; use COLLECT_MODE=backfill",
@@ -405,6 +530,14 @@ def main() -> None:
 
     log.info("Total dividend records collected: %d", total_dividends)
 
+    if failed_periods == len(periods):
+        message = f"All {len(periods)} dividend report periods failed on {target_today}"
+        set_setting(d1, prefix, "collect_dividends_last_failure", message, utc_now_iso())
+        log.error(message)
+        sys.exit(1)
+    if failed_periods:
+        log.warning("%d of %d report periods failed; see warnings above", failed_periods, len(periods))
+
     try:
         collect_fundamentals_snapshot(d1, prefix)
     except Exception as exc:  # noqa: BLE001 - optional enrichment
@@ -412,19 +545,20 @@ def main() -> None:
 
     codes = [
         normalize_ticker(r["code"])
-        for r in d1.execute_sql(f"SELECT DISTINCT code FROM {prefix}dividends")
+        for r in d1.execute_sql(
+            f"SELECT DISTINCT code FROM {prefix}dividends WHERE status = 'implemented' ORDER BY code"
+        )
     ]
-    log.info("Recomputing yields for %d stocks with dividend history", len(codes))
-    for i, code in enumerate(codes, start=1):
-        try:
-            recompute_yields_for_stock(d1, prefix, code)
-        except Exception as exc:  # noqa: BLE001 - one stock must not abort the batch
-            log.warning("%s: yield computation failed: %s", code, exc)
-        if i % 100 == 0:
-            log.info("Yield recompute progress: %d/%d", i, len(codes))
+    log.info("Recomputing yields for %d stocks with implemented dividends", len(codes))
+    yield_progress = run_yield_recompute(d1, prefix, codes)
+    if not yield_progress["completed"]:
+        log.info(
+            "Yield recompute paused at cursor %s (%d/%d); next run resumes",
+            yield_progress["cursor"],
+            yield_progress["processed"],
+            yield_progress["total"],
+        )
 
-    if failed_periods:
-        log.warning("%d of %d report periods failed; see warnings above", failed_periods, len(periods))
     log.info("Done.")
 
 

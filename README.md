@@ -124,8 +124,9 @@ python tools/local_e2e.py
 
 - `auto`（默认）：盘中用一次全市场快照，15:05（北京时间）后自动切到收盘覆盖；
 - `snapshot` / `close`：强制快照 / 收盘快照；
-- `history` / `backfill`：逐股日线回退，按 `PRICE_BATCH_SIZE` 分片，游标存
-  `system_settings`，可断点续跑。
+- `history` / `backfill`：逐股日线回退，按 `PRICE_BATCH_SIZE` 分片（默认
+  history 600 只、backfill 30 只），每 10 只 checkpoint，18 分钟软截止；
+  游标存 `system_settings`，可断点续跑。
 
 分红采集模式（`COLLECT_MODE`）：`daily`（默认，最近 3 个已披露报告期）或
 `backfill`（`BACKFILL_PERIODS`，默认 20 个报告期 ≈ 10 年）。

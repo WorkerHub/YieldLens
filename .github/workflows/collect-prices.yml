@@ -32,12 +32,12 @@ on:
           - auto
           - close
           - snapshot
+          - history
           - backfill
         default: auto
       batch_size:
-        description: "Stocks per shard for history/backfill modes"
+        description: "Stocks per shard (blank = 600 for history, 30 for backfill)"
         required: false
-        default: "600"
 
 permissions:
   contents: read
@@ -69,5 +69,5 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TABLE_PREFIX: ${{ vars.TABLE_PREFIX }}
           PRICE_MODE: ${{ github.event.inputs.mode || 'auto' }}
-          PRICE_BATCH_SIZE: ${{ github.event.inputs.batch_size || '600' }}
+          PRICE_BATCH_SIZE: ${{ github.event.inputs.batch_size || (github.event.inputs.mode == 'backfill' && '30' || '600') }}
         run: python collect_prices.py

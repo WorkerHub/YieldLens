@@ -13,6 +13,8 @@ class TestCollectorWorkflows(unittest.TestCase):
         text = (WORKFLOWS / "collect-prices.yml").read_text(encoding="utf-8")
         self.assertIn("PRICE_MODE:", text)
         self.assertIn("github.event.inputs.mode || 'auto'", text)
+        self.assertIn("- history", text)
+        self.assertIn("github.event.inputs.mode == 'backfill' && '30' || '600'", text)
         self.assertIn("concurrency:", text)
         self.assertIn("cancel-in-progress: false", text)
         self.assertIn('cron: "10 7 * * 1-5"', text)  # 15:10 CST close run
@@ -26,6 +28,7 @@ class TestCollectorWorkflows(unittest.TestCase):
         self.assertIn("github.event.inputs.mode || 'daily'", text)
         self.assertIn("options:", text)
         self.assertIn("backfill", text)
+        self.assertIn("github.event.inputs.mode == 'backfill'", text)
         self.assertIn("concurrency:", text)
 
     def test_workflows_request_only_read_permission(self):

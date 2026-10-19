@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 import pandas as pd
@@ -24,11 +25,22 @@ class FakeD1:
     def __init__(self):
         self.table = None
         self.rows = None
+        self.settings = {}
 
     def upsert_rows(self, table, rows):
         self.table = table
         self.rows = rows
         return len(rows)
+
+    def execute_sql(self, sql, params=None):
+        params = list(params or [])
+        upper = sql.strip().upper()
+        if upper.startswith("SELECT VALUE FROM") and "SYSTEM_SETTINGS" in upper:
+            value = self.settings.get(params[0])
+            return [{"value": value}] if value is not None else []
+        if upper.startswith("INSERT OR REPLACE INTO") and "SYSTEM_SETTINGS" in upper:
+            self.settings[params[0]] = params[1]
+        return []
 
 
 def _frame(rows):
@@ -108,15 +120,34 @@ class TestDividendCleaning(unittest.TestCase):
         self.assertEqual(written, 0)
         self.assertIsNone(d1.rows)
 
-    def test_upstream_failure_does_not_abort_period(self):
+    def test_upstream_failure_is_not_silently_treated_as_empty(self):
         d1 = FakeD1()
         with patch.object(
             collect_dividends.ak, "stock_fhps_em", side_effect=ConnectionResetError("reset")
         ):
             with patch.object(collect_dividends.eastmoney_limiter, "wait"):
                 with patch("common.retry.time.sleep", lambda _: None):
-                    written = collect_dividends.collect_dividends_for_period(d1, "", "20251231")
-        self.assertEqual(written, 0)
+                    with self.assertRaises(Exception):
+                        collect_dividends.collect_dividends_for_period(d1, "", "20251231")
+        self.assertIsNone(d1.rows)
+
+
+class TestDividendMainFailures(unittest.TestCase):
+    def test_all_periods_failing_exits_non_zero_and_records_health_marker(self):
+        d1 = FakeD1()
+        with patch.object(collect_dividends, "D1Client", lambda: d1):
+            with patch.object(collect_dividends, "sync_stock_list"):
+                with patch.object(collect_dividends, "resolve_collect_mode", return_value="daily"):
+                    with patch.object(
+                        collect_dividends,
+                        "collect_dividends_for_period",
+                        side_effect=RuntimeError("upstream reset"),
+                    ):
+                        with self.assertRaises(SystemExit) as ctx:
+                            collect_dividends.main(today=date(2026, 10, 19))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("collect_dividends_last_failure", d1.settings)
+        self.assertIn("All 3 dividend report periods failed", d1.settings["collect_dividends_last_failure"])
 
 
 class TestDividendStatus(unittest.TestCase):

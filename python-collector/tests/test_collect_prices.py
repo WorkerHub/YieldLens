@@ -105,6 +105,8 @@ class TestSnapshotWriter(unittest.TestCase):
         self.assertTrue(all(r["trade_date"] == "2026-10-19" for r in rows))
         self.assertIsNone(rows[0]["high"])
         self.assertIsNone(rows[1]["volume"])
+        # AKShare spot volume is in 手; stock_prices.volume stores shares.
+        self.assertEqual(rows[0]["volume"], 100_000.0)
         self.assertEqual(rows[0]["close"], 1500.0)
 
         table, key, updated, columns, static = d1.updates[0]
@@ -218,13 +220,29 @@ class TestModeResolution(unittest.TestCase):
             self.assertEqual(collect_prices.resolve_price_mode(now=now), "backfill")
 
 
+class TestSnapshotFailClosed(unittest.TestCase):
+    def test_missing_calendar_skips_write_and_exits_non_zero(self):
+        d1 = FakeD1()
+        with patch.object(collect_prices, "D1Client", lambda: d1):
+            with patch.object(collect_prices, "sync_stock_list"):
+                with patch.object(collect_prices, "resolve_price_mode", return_value="snapshot"):
+                    with patch.object(collect_prices, "load_trading_calendar", return_value=None):
+                        with patch.object(collect_prices, "is_trading_day", return_value=None):
+                            with self.assertRaises(SystemExit) as ctx:
+                                collect_prices.main(today=date(2026, 10, 19))
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("collect_prices_last_failure", d1.settings)
+        self.assertEqual(d1.upserts, [])
+        self.assertEqual(d1.updates, [])
+
+
 class TestShardedHistory(unittest.TestCase):
     def test_cursor_resumes_and_completes(self):
         codes = [f"{i:06d}" for i in range(1, 6)]
         d1 = FakeD1()
         processed = []
 
-        def fake_collect(_d1, _prefix, code, _backfill):
+        def fake_collect(_d1, _prefix, code, _backfill, **_kwargs):
             processed.append(code)
             return True
 
@@ -252,20 +270,51 @@ class TestShardedHistory(unittest.TestCase):
         codes = ["000001", "000002", "000003"]
         d1 = FakeD1()
         results = iter([True, False, True])
-        with patch.object(collect_prices, "collect_one_stock", side_effect=lambda *_: next(results)):
+        with patch.object(
+            collect_prices, "collect_one_stock", side_effect=lambda *_a, **_k: next(results)
+        ):
             progress = collect_prices.run_sharded_history(
-                d1, "", codes, mode="history", batch_size=3, today=date(2026, 10, 19)
+                d1,
+                "",
+                codes,
+                mode="history",
+                batch_size=3,
+                today=date(2026, 10, 19),
+                max_failure_rate=0.5,
             )
         self.assertEqual(progress["success"], 2)
         self.assertEqual(progress["failure"], 1)
         self.assertTrue(progress["completed"])
+
+    def test_high_failure_rate_rolls_cursor_back_to_first_failure(self):
+        codes = ["000001", "000002", "000003", "000004"]
+        d1 = FakeD1()
+        results = iter([True, False, True, True])
+        with patch.object(
+            collect_prices, "collect_one_stock", side_effect=lambda *_a, **_k: next(results)
+        ):
+            progress = collect_prices.run_sharded_history(
+                d1,
+                "",
+                codes,
+                mode="history",
+                batch_size=4,
+                today=date(2026, 10, 19),
+            )
+        self.assertTrue(progress["failure_rate_exceeded"])
+        self.assertFalse(progress["completed"])
+        self.assertEqual(progress["failed_codes"], ["000002"])
+        # Cursor points at the code before the first failure, so 000002 is
+        # retried on the next run instead of being skipped.
+        self.assertEqual(progress["cursor"], "000001")
+        self.assertEqual(d1.settings["price_history_cursor:2026-10-19"], "000001")
 
     def test_one_stock_exception_does_not_abort_the_shard(self):
         codes = ["000001", "000002", "000003"]
         d1 = FakeD1()
         calls = []
 
-        def fake_collect(_d1, _prefix, code, _backfill):
+        def fake_collect(_d1, _prefix, code, _backfill, **_kwargs):
             calls.append(code)
             if code == "000002":
                 raise RuntimeError("D1 write failed")
@@ -273,12 +322,48 @@ class TestShardedHistory(unittest.TestCase):
 
         with patch.object(collect_prices, "collect_one_stock", side_effect=fake_collect):
             progress = collect_prices.run_sharded_history(
-                d1, "", codes, mode="history", batch_size=3, today=date(2026, 10, 19)
+                d1,
+                "",
+                codes,
+                mode="history",
+                batch_size=3,
+                today=date(2026, 10, 19),
+                max_failure_rate=0.5,
             )
         self.assertEqual(calls, codes)
         self.assertEqual(progress["success"], 2)
         self.assertEqual(progress["failure"], 1)
         self.assertTrue(progress["completed"])
+
+    def test_soft_deadline_stops_and_saves_cursor(self):
+        codes = ["000001", "000002", "000003", "000004", "000005"]
+        d1 = FakeD1()
+        processed = []
+        ticks = iter([0, 1, 2, 3, 100])  # start + one check per stock
+
+        def fake_collect(_d1, _prefix, code, _backfill, **_kwargs):
+            processed.append(code)
+            return True
+
+        with patch.object(collect_prices, "collect_one_stock", side_effect=fake_collect):
+            progress = collect_prices.run_sharded_history(
+                d1,
+                "",
+                codes,
+                mode="backfill",
+                batch_size=5,
+                today=date(2026, 10, 19),
+                deadline_seconds=10,
+                checkpoint_every=2,
+                monotonic=lambda: next(ticks),
+            )
+
+        self.assertEqual(processed, ["000001", "000002", "000003"])
+        self.assertEqual(progress["stopped_reason"], "deadline")
+        self.assertFalse(progress["completed"])
+        self.assertEqual(progress["cursor"], "000003")
+        self.assertEqual(d1.settings["price_backfill_cursor"], "000003")
+        self.assertEqual(progress["processed"], 3)
 
 
 if __name__ == "__main__":
