@@ -7,9 +7,11 @@
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "deploy": "wrangler deploy",
-    "db:migrate:local": "sed 's/{prefix}//g' src/db/schema.sql > .schema.local.sql && wrangler d1 execute DB --local --file=.schema.local.sql && rm .schema.local.sql",
-    "db:seed:local": "wrangler d1 execute DB --local --file=seed.sql",
-    "db:migrate:remote": "sed 's/{prefix}//g' src/db/schema.sql > .schema.remote.sql && wrangler d1 execute DB --remote --file=.schema.remote.sql && rm .schema.remote.sql"
+    "test": "node --test scripts/table-prefix.test.mjs",
+    "db:sql:local": "node scripts/build-sql.mjs src/db/schema.sql .schema.local.sql",
+    "db:migrate:local": "pnpm db:sql:local && wrangler d1 execute DB --local --file=.schema.local.sql && rm .schema.local.sql",
+    "db:seed:local": "node scripts/build-sql.mjs seed.sql .seed.local.sql && wrangler d1 execute DB --local --file=.seed.local.sql && rm .seed.local.sql",
+    "db:migrate:remote": "node scripts/build-sql.mjs src/db/schema.sql .schema.remote.sql && wrangler d1 execute DB --remote --file=.schema.remote.sql && rm .schema.remote.sql"
   },
   "dependencies": {
     "hono": "^4.7.9"

@@ -9,8 +9,14 @@ export type HonoEnv = {
   Bindings: Env;
 };
 
+/**
+ * Single runtime rule for table names. Must match
+ * python-collector/common/table_prefix.py and worker/scripts/table-prefix.mjs:
+ * trim, empty -> "", otherwise append "_" unless already present.
+ * The raw value is validated by the middleware in index.ts.
+ */
 export function getTablePrefix(env: Env): string {
-  const raw = env.TABLE_PREFIX || "";
+  const raw = (env.TABLE_PREFIX || "").trim();
   if (!raw) return "";
   return raw.endsWith("_") ? raw : `${raw}_`;
 }

@@ -1,18 +1,14 @@
 name: Collect Stock Prices
 
-# Runs during A-share trading hours (09:30-15:00 Beijing time, UTC+8; lunch
-# break 11:30-13:00 skipped), roughly every 30 minutes. GitHub Actions cron
-# has no exact-time guarantee, so this is "frequent intraday polling," not
-# real-time — see PRD.md section 7.2.2 for the tradeoff discussion.
+# A-share trading hours are 09:30-15:00 Beijing time (UTC+8). Intraday runs
+# every 30 minutes take one full-market snapshot; the 15:10 run switches to
+# "close" mode, which always re-fetches and overwrites today's row with the
+# final closing price. GitHub cron is best-effort, so runs can be delayed.
 #
-# NOTE (known limitation, tune after first deployment): collect_prices.py's
-# incremental mode fetches every stock whose price hasn't been updated today,
-# rate-limited to ~1 request/sec against Sina. On the first run of a trading
-# day this means ~5000+ sequential HTTP calls, which will exceed this job's
-# 25-minute timeout on the full A-share universe. Before relying on this in
-# production, either (a) split incremental collection into batches the same
-# way BACKFILL_BATCH does for the initial backfill, or (b) raise timeout-minutes
-# and accept a slower per-run cadence.
+# Throughput: the snapshot path is a single upstream call for the whole market
+# and fits comfortably in the 25-minute job limit. If that endpoint is down,
+# the collector falls back to per-stock daily bars, sharded across runs with a
+# cursor stored in system_settings (PRICE_BATCH_SIZE stocks per shard).
 on:
   schedule:
     - cron: "30 1 * * 1-5"  # 09:30 CST
@@ -25,12 +21,30 @@ on:
     - cron: "30 5 * * 1-5"  # 13:30 CST
     - cron: "0 6 * * 1-5"   # 14:00 CST
     - cron: "30 6 * * 1-5"  # 14:30 CST
-    - cron: "0 7 * * 1-5"   # 15:00 CST (closing prices)
+    - cron: "10 7 * * 1-5"  # 15:10 CST — closing prices
+    - cron: "40 7 * * 1-5"  # 15:40 CST — closing-price retry
   workflow_dispatch:
     inputs:
-      backfill_batch:
-        description: "Backfill batch index (0-49). Leave empty for incremental mode."
+      mode:
+        description: "auto = snapshot intraday / close after 15:05; backfill = ~10 years per stock (sharded)"
+        type: choice
+        options:
+          - auto
+          - close
+          - snapshot
+          - backfill
+        default: auto
+      batch_size:
+        description: "Stocks per shard for history/backfill modes"
         required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: collect-prices
+  cancel-in-progress: false
 
 jobs:
   collect:
@@ -54,6 +68,6 @@ jobs:
           CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           TABLE_PREFIX: ${{ vars.TABLE_PREFIX }}
-          BACKFILL_MODE: ${{ github.event.inputs.backfill_batch != '' && 'true' || 'false' }}
-          BACKFILL_BATCH: ${{ github.event.inputs.backfill_batch || '0' }}
+          PRICE_MODE: ${{ github.event.inputs.mode || 'auto' }}
+          PRICE_BATCH_SIZE: ${{ github.event.inputs.batch_size || '600' }}
         run: python collect_prices.py

@@ -2,21 +2,18 @@
 """Dividend + fundamentals collector — run once daily after market close.
 
 Steps:
-  1. Sync the full A-share stock list (code/name) from AKShare's official
-     exchange data, so newly-listed stocks and renames are picked up.
-  2. Bulk-fetch dividend records for the last N report periods (year-end +
-     mid-year) via ak.stock_fhps_em(), which returns the whole market in one
-     call per period — this is why dividends are cheap to backfill compared
-     to price history.
-  3. Best-effort fetch of market cap / PE / PB / industry via
-     ak.stock_zh_a_spot_em(). This endpoint depends on Eastmoney's numbered
-     push2 subdomains, which were unreachable from the sandbox this collector
-     was developed in (see PRD.md section 5.2) — production GitHub Actions
-     runners have normal internet access, but this step is wrapped so a
-     failure here never aborts the whole run.
+  1. Sync the full A-share stock list (code/name) with upstream fallbacks
+     (see common/stock_list.py).
+  2. Bulk-fetch dividend records for the requested report periods via
+     ak.stock_fhps_em(), which returns the whole market in one call per period.
+  3. Best-effort market cap / PE / PB snapshot via ak.stock_zh_a_spot_em().
   4. Recompute static/TTM dividend yield time series (`dividend_yields`) and
      the denormalized current-yield columns on `stocks`, using dividend
      history plus the price history collected by collect_prices.py.
+
+Modes (``COLLECT_MODE``):
+  - ``daily`` (default): the three most recently disclosed report periods.
+  - ``backfill``: the last 10 years (20 periods), or ``BACKFILL_PERIODS``.
 """
 
 from __future__ import annotations
@@ -24,82 +21,82 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import akshare as ak
-import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:  # local runs can use python-collector/.env; CI injects real env vars
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # pragma: no cover - requirements.txt installs it
+    pass
 
 from common.d1_client import D1Client
+from common.numeric import clean_date, to_float
 from common.rate_limiter import eastmoney_limiter
+from common.retry import call_with_retries
+from common.stock_list import sync_stock_list
 from common.table_prefix import get_table_prefix
-from common.ticker_utils import infer_exchange, normalize_ticker
+from common.ticker_utils import normalize_ticker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("collect_dividends")
 
 BACKFILL_YEARS = 10
+DAILY_REPORT_PERIODS = 3
+VALID_MODES = {"daily", "backfill"}
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 
-def sync_stock_list(d1: D1Client, prefix: str) -> None:
-    log.info("Syncing stock list from ak.stock_info_a_code_name()")
-    df = ak.stock_info_a_code_name()
-    now = datetime.utcnow().isoformat() + "Z"
-
-    rows = []
-    for _, r in df.iterrows():
-        code = str(r["code"]).zfill(6)
-        rows.append(
-            {
-                "code": code,
-                "name": r["name"],
-                "market": "A",
-                "exchange": infer_exchange(code),
-                "industry": "",
-                "total_shares": None,
-                "float_shares": None,
-                "is_st": 0,
-                "list_date": None,
-                "last_price": None,
-                "price_updated_at": None,
-                "market_cap": None,
-                "pe_ttm": None,
-                "pb": None,
-                "static_yield": None,
-                "ttm_yield": None,
-                "yield_updated_at": None,
-                "last_dividend_date": None,
-                "consecutive_dividend_years": 0,
-                "created_at": now,
-                "updated_at": now,
-            }
-        )
-
-    # INSERT OR REPLACE would clobber columns populated elsewhere (last_price,
-    # yields, etc) with NULLs for already-existing stocks, so only insert
-    # codes that aren't already present.
-    existing = {
-        r["code"] for r in d1.execute_sql(f"SELECT code FROM {prefix}stocks")
-    }
-    new_rows = [r for r in rows if r["code"] not in existing]
-    if new_rows:
-        written = d1.upsert_rows(f"{prefix}stocks", new_rows)
-        log.info(f"Added {written} newly-listed stocks")
-    else:
-        log.info("No new stocks to add")
+def beijing_today() -> date:
+    return datetime.now(BEIJING_TZ).date()
 
 
-def report_periods(years: int) -> list[str]:
-    """Return 'YYYYMMDD' report period dates: year-end + mid-year for each
-    of the last `years` years, most recent first.
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def latest_disclosed_report_period(today: date | None = None) -> str:
+    """Return the most recent report period that can plausibly have data.
+
+    A-share annual reports (``YYYY1231``) are due by April 30 of the following
+    year; half-year reports (``YYYY0630``) are due by August 31. From July 1 we
+    therefore start from the current year's half-year period (early reporters
+    are already publishing), otherwise from the previous year's annual period.
     """
-    periods = []
-    current_year = date.today().year
-    for y in range(current_year, current_year - years, -1):
-        periods.append(f"{y}1231")
-        periods.append(f"{y}0630")
+    current = today or beijing_today()
+    if (current.month, current.day) > (6, 30):
+        return f"{current.year}0630"
+    return f"{current.year - 1}1231"
+
+
+def report_periods(years: int, today: date | None = None) -> list[str]:
+    """Return ``2 * years`` report periods, most recent disclosed first."""
+    if years <= 0:
+        return []
+    end = latest_disclosed_report_period(today)
+    year = int(end[:4])
+    month = int(end[4:6])
+    periods: list[str] = []
+    for _ in range(years * 2):
+        if month == 6:
+            periods.append(f"{year}0630")
+            year -= 1
+            month = 12
+        else:
+            periods.append(f"{year}1231")
+            month = 6
     return periods
+
+
+def daily_report_periods(count: int = DAILY_REPORT_PERIODS, today: date | None = None) -> list[str]:
+    """Daily incremental window: at least the last three report periods."""
+    periods = report_periods(max(2, (count + 1) // 2 + 1), today)
+    return periods[:count]
 
 
 DIVIDEND_STATUS_MAP = {
@@ -111,41 +108,63 @@ DIVIDEND_STATUS_MAP = {
 }
 
 
-def parse_dividend_status(raw: str | None) -> str:
-    if not raw:
+def parse_dividend_status(raw: object) -> str:
+    if not isinstance(raw, str):
+        # pandas NaN/NaT and None all land here.
         return "proposal"
-    return DIVIDEND_STATUS_MAP.get(raw, "implemented" if "实施" in raw else "proposal")
+    text = raw.strip()
+    if not text:
+        return "proposal"
+    return DIVIDEND_STATUS_MAP.get(text, "implemented" if "实施" in text else "proposal")
+
+
+def fetch_dividend_frame(period: str):
+    def _fetch():
+        eastmoney_limiter.wait()
+        return ak.stock_fhps_em(date=period)
+
+    return call_with_retries(
+        _fetch,
+        description=f"ak.stock_fhps_em(date={period})",
+        max_attempts=3,
+        logger=log,
+    )
 
 
 def collect_dividends_for_period(d1: D1Client, prefix: str, period: str) -> int:
-    eastmoney_limiter.wait()
     try:
-        df = ak.stock_fhps_em(date=period)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(f"stock_fhps_em({period}) failed: {exc}")
+        df = fetch_dividend_frame(period)
+    except Exception as exc:  # noqa: BLE001 - one period must not abort the run
+        log.warning("stock_fhps_em(%s) failed after retries: %s", period, exc)
         return 0
 
     if df is None or df.empty:
+        log.info("Report period %s: upstream returned no rows", period)
         return 0
 
-    now = datetime.utcnow().isoformat() + "Z"
+    now = utc_now_iso()
     report_period_str = f"{period[:4]}-{period[4:6]}-{period[6:8]}"
     rows = []
 
-    for _, r in df.iterrows():
-        code = str(r["代码"]).zfill(6)
+    for _, record in df.iterrows():
+        try:
+            code = normalize_ticker(str(record["代码"]).split(".")[0].zfill(6))
+        except ValueError:
+            continue
         # "现金分红-现金分红比例" is expressed per 10 shares (e.g. 1.6 means
         # "10派1.6元"); convert to a true per-share amount.
-        per_10_shares = r.get("现金分红-现金分红比例")
-        if per_10_shares is None or pd.isna(per_10_shares):
+        per_10_shares = to_float(record.get("现金分红-现金分红比例"))
+        if per_10_shares is None:
             continue
-        per_share_div = float(per_10_shares) / 10.0
+        per_share_div = round(per_10_shares / 10.0, 6)
         if per_share_div <= 0:
             continue
 
-        ex_div_date = r.get("除权除息日")
-        record_date = r.get("股权登记日")
-        status = parse_dividend_status(r.get("方案进度"))
+        # NaN/None/Inf -> 0.0 for the bonus/transfer columns. Without this,
+        # float(NaN) survives `or 0` and requests raises InvalidJSONError
+        # before the D1 request is sent.
+        bonus_share_ratio = to_float(record.get("送转股份-送转比例"), 0.0) or 0.0
+        transfer_ratio = to_float(record.get("送转股份-转股比例"), 0.0) or 0.0
 
         rows.append(
             {
@@ -153,12 +172,12 @@ def collect_dividends_for_period(d1: D1Client, prefix: str, period: str) -> int:
                 "code": code,
                 "report_period": report_period_str,
                 "per_share_div": per_share_div,
-                "record_date": str(record_date) if record_date and not pd.isna(record_date) else None,
-                "ex_div_date": str(ex_div_date) if ex_div_date and not pd.isna(ex_div_date) else None,
+                "record_date": clean_date(record.get("股权登记日")),
+                "ex_div_date": clean_date(record.get("除权除息日")),
                 "pay_date": None,
-                "status": status,
-                "bonus_share_ratio": float(r.get("送转股份-送转比例") or 0) or 0,
-                "transfer_ratio": float(r.get("送转股份-转股比例") or 0) or 0,
+                "status": parse_dividend_status(record.get("方案进度")),
+                "bonus_share_ratio": bonus_share_ratio,
+                "transfer_ratio": transfer_ratio,
                 "payout_ratio": None,
                 "source": "akshare_fhps_em",
                 "created_at": now,
@@ -172,46 +191,58 @@ def collect_dividends_for_period(d1: D1Client, prefix: str, period: str) -> int:
 
 
 def collect_fundamentals_snapshot(d1: D1Client, prefix: str) -> None:
-    """Best-effort market cap / PE / PB / industry snapshot.
+    """Best-effort market cap / PE / PB snapshot, written in bulk.
 
-    ak.stock_zh_a_spot_em() depends on Eastmoney's numbered push2 subdomains
-    (e.g. 82.push2.eastmoney.com), which are known to be unreachable from
-    some sandboxed environments (see PRD.md 5.2/5.3). A failure here must
-    never abort the rest of the collection run.
+    A failure here must never abort the rest of the collection run.
     """
     try:
-        eastmoney_limiter.wait()
-        df = ak.stock_zh_a_spot_em()
-    except Exception as exc:  # noqa: BLE001
-        log.warning(f"stock_zh_a_spot_em() failed (fundamentals snapshot skipped): {exc}")
+
+        def _fetch():
+            eastmoney_limiter.wait()
+            return ak.stock_zh_a_spot_em()
+
+        df = call_with_retries(
+            _fetch,
+            description="ak.stock_zh_a_spot_em() (fundamentals snapshot)",
+            max_attempts=3,
+            logger=log,
+        )
+    except Exception as exc:  # noqa: BLE001 - optional enrichment
+        log.warning("stock_zh_a_spot_em() failed (fundamentals snapshot skipped): %s", exc)
         return
 
     if df is None or df.empty:
         log.warning("stock_zh_a_spot_em() returned no data")
         return
 
-    now = datetime.utcnow().isoformat() + "Z"
-    updated = 0
-    for _, r in df.iterrows():
-        code = str(r["代码"]).zfill(6)
-        market_cap = r.get("总市值")
-        pe_ttm = r.get("市盈率-动态")
-        pb = r.get("市净率")
-        if market_cap is None or pd.isna(market_cap):
+    now = utc_now_iso()
+    updates = []
+    for _, record in df.iterrows():
+        try:
+            code = normalize_ticker(str(record["代码"]).split(".")[0].zfill(6))
+        except ValueError:
             continue
-        d1.execute_sql(
-            f"UPDATE {prefix}stocks SET market_cap = ?, pe_ttm = ?, pb = ?, updated_at = ? WHERE code = ?",
-            [
-                float(market_cap) / 1e8,  # AKShare returns raw CNY; store as 亿元
-                float(pe_ttm) if pe_ttm is not None and not pd.isna(pe_ttm) else None,
-                float(pb) if pb is not None and not pd.isna(pb) else None,
-                now,
-                code,
-            ],
+        market_cap = to_float(record.get("总市值"))
+        if market_cap is None:
+            continue
+        updates.append(
+            {
+                "code": code,
+                "market_cap": market_cap / 1e8,  # AKShare returns raw CNY; store as 亿元
+                "pe_ttm": to_float(record.get("市盈率-动态")),
+                "pb": to_float(record.get("市净率")),
+            }
         )
-        updated += 1
 
-    log.info(f"Updated fundamentals snapshot for {updated} stocks")
+    if updates:
+        d1.update_rows(
+            f"{prefix}stocks",
+            "code",
+            updates,
+            ["market_cap", "pe_ttm", "pb"],
+            static_values={"updated_at": now},
+        )
+    log.info("Updated fundamentals snapshot for %d stocks", len(updates))
 
 
 def price_on_or_before(prices: list[dict], target_date: str) -> float | None:
@@ -245,10 +276,12 @@ def recompute_yields_for_stock(d1: D1Client, prefix: str, code: str) -> None:
 
     stock_row = d1.execute_sql(f"SELECT last_price FROM {prefix}stocks WHERE code = ?", [code])
     last_price = stock_row[0]["last_price"] if stock_row else None
-    if last_price is None:
+    if last_price is None or last_price <= 0:
         last_price = prices[-1]["close"]
+    if not last_price or last_price <= 0:
+        return
 
-    now = datetime.utcnow().isoformat() + "Z"
+    now = utc_now_iso()
     yield_rows = []
 
     for d in implemented:
@@ -258,7 +291,8 @@ def recompute_yields_for_stock(d1: D1Client, prefix: str, code: str) -> None:
             continue
 
         # Static yield anchored at this date: dividends from the single most
-        # recent complete fiscal year as of this date.
+        # recent complete fiscal year as of this date. (Metric definition is
+        # intentionally unchanged in this round.)
         this_year = int(d["report_period"][:4])
         same_year_divs = [
             x["per_share_div"] for x in implemented if x["report_period"][:4] == str(this_year)
@@ -329,39 +363,68 @@ def recompute_yields_for_stock(d1: D1Client, prefix: str, code: str) -> None:
     )
 
 
+def resolve_collect_mode() -> str:
+    mode = os.environ.get("COLLECT_MODE", "daily").strip().lower()
+    if mode not in VALID_MODES:
+        raise ValueError(f"Invalid COLLECT_MODE {mode!r}; expected one of {sorted(VALID_MODES)}")
+    return mode
+
+
 def main() -> None:
     prefix = get_table_prefix()
     d1 = D1Client()
-    backfill_periods = int(os.environ.get("BACKFILL_PERIODS", "1"))
+    mode = resolve_collect_mode()
 
-    sync_stock_list(d1, prefix)
+    sync_stock_list(d1, prefix, log)
 
-    all_periods = report_periods(BACKFILL_YEARS)
-    periods = all_periods[:backfill_periods]
+    if mode == "backfill":
+        all_periods = report_periods(BACKFILL_YEARS)
+        requested = int(os.environ.get("BACKFILL_PERIODS", str(len(all_periods))))
+        periods = all_periods[: max(1, requested)]
+    else:
+        periods = daily_report_periods(DAILY_REPORT_PERIODS)
+        if os.environ.get("BACKFILL_PERIODS"):
+            log.info(
+                "COLLECT_MODE=daily ignores BACKFILL_PERIODS=%s; use COLLECT_MODE=backfill",
+                os.environ["BACKFILL_PERIODS"],
+            )
+
+    log.info("Collect mode=%s, report periods=%s", mode, periods)
 
     total_dividends = 0
+    failed_periods = 0
     for period in periods:
-        n = collect_dividends_for_period(d1, prefix, period)
+        try:
+            n = collect_dividends_for_period(d1, prefix, period)
+        except Exception as exc:  # noqa: BLE001 - keep collecting other periods
+            failed_periods += 1
+            log.error("Period %s failed: %s", period, exc)
+            continue
         total_dividends += n
-        log.info(f"Period {period}: {n} dividend records")
+        log.info("Period %s: %d dividend records", period, n)
 
-    log.info(f"Total dividend records collected: {total_dividends}")
+    log.info("Total dividend records collected: %d", total_dividends)
 
-    collect_fundamentals_snapshot(d1, prefix)
+    try:
+        collect_fundamentals_snapshot(d1, prefix)
+    except Exception as exc:  # noqa: BLE001 - optional enrichment
+        log.warning("Fundamentals snapshot failed: %s", exc)
 
     codes = [
         normalize_ticker(r["code"])
         for r in d1.execute_sql(f"SELECT DISTINCT code FROM {prefix}dividends")
     ]
-    log.info(f"Recomputing yields for {len(codes)} stocks with dividend history")
+    log.info("Recomputing yields for %d stocks with dividend history", len(codes))
     for i, code in enumerate(codes, start=1):
         try:
             recompute_yields_for_stock(d1, prefix, code)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(f"{code}: yield computation failed: {exc}")
+        except Exception as exc:  # noqa: BLE001 - one stock must not abort the batch
+            log.warning("%s: yield computation failed: %s", code, exc)
         if i % 100 == 0:
-            log.info(f"Yield recompute progress: {i}/{len(codes)}")
+            log.info("Yield recompute progress: %d/%d", i, len(codes))
 
+    if failed_periods:
+        log.warning("%d of %d report periods failed; see warnings above", failed_periods, len(periods))
     log.info("Done.")
 
 
