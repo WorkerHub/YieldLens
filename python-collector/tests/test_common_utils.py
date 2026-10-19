@@ -49,6 +49,8 @@ class TestTablePrefix(unittest.TestCase):
         self.assertEqual(normalize_table_prefix("   "), "")
         self.assertEqual(normalize_table_prefix("yl"), "yl_")
         self.assertEqual(normalize_table_prefix("yl_"), "yl_")
+        self.assertEqual(normalize_table_prefix("YL"), "YL_")
+        self.assertEqual(normalize_table_prefix("YL_"), "YL_")
         self.assertEqual(normalize_table_prefix("_tenant"), "_tenant_")
 
     def test_invalid_prefix_rejected(self):

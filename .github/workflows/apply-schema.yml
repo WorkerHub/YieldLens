@@ -1,0 +1,53 @@
+name: Apply D1 Schema
+
+# Manually apply worker/src/db/schema.sql to the organization's shared D1
+# database. The schema is idempotent (CREATE ... IF NOT EXISTS), so re-running
+# it is safe. Sample data (worker/seed.sql) is never applied here.
+#
+# Credentials come from organization-level variables/secrets, not from
+# wrangler.toml placeholders. The collector talks to the D1 HTTP API directly.
+on:
+  workflow_dispatch:
+    inputs:
+      prefix:
+        description: "Table prefix (default YL; YL and YL_ both mean YL_)"
+        required: false
+        default: "YL"
+      dry_run:
+        description: "Print the generated statements without sending them to D1"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apply-schema
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: python-collector/requirements.txt
+
+      - run: pip install -r python-collector/requirements.txt
+
+      - name: Apply schema to shared D1
+        working-directory: python-collector
+        env:
+          # Organization-level shared configuration (inherited by this repo).
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TABLE_PREFIX: ${{ github.event.inputs.prefix || 'YL' }}
+        run: |
+          python tools/apply_schema.py --prefix "$TABLE_PREFIX" ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}

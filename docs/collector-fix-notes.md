@@ -409,50 +409,82 @@ pnpm test:worker
 
 ## 5. 上线前仍需用户完成的事项
 
-### 5.1 创建 Cloudflare 资源并填 ID
+### 5.1 准备 Cloudflare 资源并填 ID
+
+D1 使用团队共享数据库，**不要再执行 `wrangler d1 create`**；只需为本项目
+创建 KV：
 
 ```bash
-npx wrangler d1 create yieldlens
 npx wrangler kv namespace create YIELDLENS_KV
 ```
 
-把 `database_id`、KV `id`、`account_id` 填入 `worker/wrangler.toml`（或改用
-CI 变量注入）。仓库里当前仍是占位符，不要提交真实 ID。
+部署 Worker 时把共享 `database_id`、KV `id`、`account_id` 填入本地
+`worker/wrangler.toml`（或使用不提交的 `wrangler.production.toml`）。仓库里
+当前仍是占位符，不要提交真实 ID。共享 D1 的建表用 5.3 的 workflow，不需要
+wrangler 的 `database_id`。
 
-### 5.2 配置 GitHub Secrets
+### 5.2 配置组织级 Variables / Secrets
 
-仓库 **Settings → Secrets and variables → Actions**：
+组织已提供共享配置，YieldLens 不再需要仓库级 Secret：
 
 | 类型 | 名称 | 说明 |
 |---|---|---|
-| Secret | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
-| Secret | `CLOUDFLARE_D1_DATABASE_ID` | D1 数据库 ID |
-| Secret | `CLOUDFLARE_API_TOKEN` | 具备 D1 读写权限的 Token |
-| Variable（可选） | `TABLE_PREFIX` | 必须与 `worker/wrangler.toml` 的 `[vars] TABLE_PREFIX` 一致 |
+| Variable | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID（组织级，所有仓库共用） |
+| Variable | `D1_DATABASE_ID` | 共享 D1 数据库 ID；workflow 内映射为 `CLOUDFLARE_D1_DATABASE_ID` |
+| Secret | `CLOUDFLARE_API_TOKEN` | 具备 D1 读写权限的 Token（组织级） |
 
-**注意**：2026-10-18 的 Actions 日志显示这三个 Secret 当前为空值
-（`CLOUDFLARE_ACCOUNT_ID:` 等后面没有值），即使代码修好，任务仍会在写 D1 时
-失败。请先补齐。
+`TABLE_PREFIX` **不使用**组织级变量：两个采集 workflow 固定为 `YL`，与
+`worker/wrangler.toml` 的 `[vars] TABLE_PREFIX = "YL"` 一致。即使组织里存在
+同名变量也不会被采集任务使用，避免共享数据库下串前缀。
 
-### 5.3 初始化生产库（前缀必须一致）
+**核验结果**：本机 `gh` 账号只有 `read:org` / `repo` / `workflow` scope，
+`gh variable list --org WorkerHub` 和 `gh secret list --org WorkerHub` 均返回
+403（需要 `admin:org`），无法从 CLI 读取组织级名称与可见性；仓库级
+variables/secrets 列表为空，说明没有仓库级覆盖。请组织管理员在 GitHub 组织
+**Settings → Secrets and variables → Actions** 中确认上述名称存在，并且对
+YieldLens 仓库可见。
+
+### 5.3 初始化生产库（共享 D1 + `YL` 前缀）
+
+推荐使用新增的 **Apply D1 Schema** workflow（`.github/workflows/apply-schema.yml`）：
+
+1. 合并到 `main` 后，打开 Actions → **Apply D1 Schema** → **Run workflow**；
+2. `prefix` 保持默认 `YL`（`YL` 和 `YL_` 都会归一化为 `YL_`）；
+3. 可选勾选 `dry_run`，只打印语句、不写数据库；
+4. 日志逐条输出 `OK` / `FAIL` 与失败原因；任一语句失败时 job 失败。
+
+等价命令：
+
+```bash
+gh workflow run apply-schema.yml -f prefix=YL
+```
+
+该 workflow 通过 D1 HTTP API 执行 `worker/src/db/schema.sql`，不依赖
+`wrangler.toml` 里的占位 ID，也不会执行 `seed.sql`。schema 全部是
+`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`，可重复运行。
+
+本地仍可用 wrangler 验证（生产不要执行 seed）：
 
 ```bash
 cd worker
-TABLE_PREFIX=yl pnpm db:migrate:remote   # 示例；不设前缀则用 wrangler.toml 的值
+TABLE_PREFIX=YL pnpm db:migrate:local
+TABLE_PREFIX=YL pnpm db:seed:local   # 仅本地样例数据
 ```
 
-`TABLE_PREFIX` 的规则：`yl` 和 `yl_` 都表示 `yl_`；必须是合法 SQL 标识符，
-不能以数字开头。建表、seed、迁移、Worker 查询、Python 采集现在使用同一规则。
+`TABLE_PREFIX` 的规则：`YL` 和 `YL_` 都表示 `YL_`；必须是合法 SQL 标识符，
+不能以数字开头。建表、seed、迁移、Worker 查询、Python 采集使用同一规则。
 
 ### 5.4 首次全量回填
 
-1. **分红/基本面**：GitHub Actions → **Collect Dividends and Fundamentals** →
+1. **建表**：GitHub Actions → **Apply D1 Schema** → **Run workflow**，
+   `prefix=YL`（默认值）。
+2. **分红/基本面**：GitHub Actions → **Collect Dividends and Fundamentals** →
    **Run workflow** → `mode=backfill`，`backfill_periods=20`。
-2. **股价历史**：GitHub Actions → **Collect Stock Prices** →
+3. **股价历史**：GitHub Actions → **Collect Stock Prices** →
    **Run workflow** → `mode=backfill`，`batch_size` 留空即用 30 只/片。
    每轮在 18 分钟软截止或处理完当前片后保存游标，重复运行直到
-   `system_settings.price_backfill_completed_at` 有值（每次从游标继续）。
-3. 日常：两个 workflow 恢复 `daily` / `auto` 即可；价格任务在交易时段每 30 分钟
+   `YL_system_settings.price_backfill_completed_at` 有值（每次从游标继续）。
+4. 日常：两个 workflow 恢复 `daily` / `auto` 即可；价格任务在交易时段每 30 分钟
    跑一次快照，15:10 / 15:40 跑收盘覆盖。
 
 ### 5.5 验证生产数据
@@ -460,15 +492,15 @@ TABLE_PREFIX=yl pnpm db:migrate:remote   # 示例；不设前缀则用 wrangler.
 ```sql
 -- 今日是否写入了收盘价
 SELECT code, last_price, price_updated_at
-FROM yl_stocks
+FROM YL_stocks
 WHERE code = '600519';
 
 -- 今日价格行
-SELECT trade_date, close FROM yl_stock_prices
+SELECT trade_date, close FROM YL_stock_prices
 WHERE code = '600519' AND trade_date = date('now', '+8 hours');
 
 -- 采集进度/游标
-SELECT key, value FROM yl_system_settings
+SELECT key, value FROM YL_system_settings
 WHERE key LIKE 'price_%' OR key LIKE 'yield_%' OR key LIKE 'collect_%' OR key = 'trading_calendar';
 ```
 
@@ -504,3 +536,105 @@ WHERE key LIKE 'price_%' OR key LIKE 'yield_%' OR key LIKE 'collect_%' OR key = 
   快照 + 逐股回退分片，保持 25 分钟上限不变。
 - 报告称股价 workflow “从未触发”；实际原因是 GitHub 上被手动禁用
   （`disabled_manually`），不是 cron/YAML 配置错误。
+
+---
+
+## 8. 共享 D1 与组织级配置（`YL` 前缀）
+
+### 8.1 背景与配置来源
+
+Cloudflare 免费额度只有 10 个 D1 数据库，团队决定所有项目共用一个 D1，
+每个项目使用独立表前缀。YieldLens 的前缀固定为 `YL`，最终表名为
+`YL_stocks`、`YL_stock_prices`、`YL_dividends`、`YL_dividend_yields`、
+`YL_system_settings`。
+
+| 类型 | 名称 | 用途 |
+|---|---|---|
+| 组织级 Variable | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
+| 组织级 Variable | `D1_DATABASE_ID` | 共享 D1 数据库 ID |
+| 组织级 Secret | `CLOUDFLARE_API_TOKEN` | D1 读写 Token |
+
+两个采集 workflow 的环境变量已改为：
+
+```yaml
+CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+CLOUDFLARE_D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
+CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+TABLE_PREFIX: "YL"
+```
+
+注意组织级变量名是 `D1_DATABASE_ID`，不是 `CLOUDFLARE_D1_DATABASE_ID`；
+workflow 只做名称映射，Python 采集器仍然读取 `CLOUDFLARE_D1_DATABASE_ID`。
+`TABLE_PREFIX` 故意不读组织级变量：共享数据库下每个项目的前缀必须独立，
+读取组织级同名变量会让所有项目串表。
+
+### 8.2 三处前缀归一化一致
+
+| 位置 | 输入 `YL` 的结果 | 实现 |
+|---|---|---|
+| Worker 运行时 | `YL_` | `worker/src/types.ts#getTablePrefix()` |
+| Python 采集器 | `YL_` | `python-collector/common/table_prefix.py` |
+| 建表/seed 脚本 | `YL_` | `worker/scripts/table-prefix.mjs` |
+
+`worker/wrangler.toml` 的 `[vars] TABLE_PREFIX` 已改为 `"YL"`，因此 Worker
+部署后查询的就是 `YL_*` 表。Node 与 Python 测试都增加了 `YL -> YL_` 断言。
+
+### 8.3 生产建表入口
+
+新增 `.github/workflows/apply-schema.yml`：
+
+- `workflow_dispatch` 手动触发，`prefix` 默认 `YL`，可选 `dry_run`；
+- 使用组织级 variables/secret，通过 D1 HTTP API 写入，不依赖
+  `wrangler.toml` 的占位 ID；
+- 调用 `python-collector/tools/apply_schema.py`，复用
+  `common/d1_client.py` 的鉴权、重试与错误处理；
+- 逐条执行 `worker/src/db/schema.sql` 并打印 `OK` / `FAIL` 及失败原因；
+- 只执行 schema，不执行 `worker/seed.sql`；
+- schema 本身是 `IF NOT EXISTS`，可重复运行。
+
+本地无凭证检查生成的 SQL：
+
+```bash
+cd python-collector
+python tools/apply_schema.py --prefix YL --dry-run
+```
+
+### 8.4 Worker 部署仍需要 `database_id`
+
+组织级 variables 不会自动替换 `wrangler.toml` 中的占位符，本轮也没有改部署
+链路。部署前仍需把共享数据库的 `database_id` 注入 Worker 配置：
+
+1. 从组织设置或 Cloudflare 控制台取得 `D1_DATABASE_ID`（有 `admin:org` 权限
+   时可执行 `gh variable get D1_DATABASE_ID --org WorkerHub`）；
+2. 在本地把 `worker/wrangler.toml` 的 `account_id` / `database_id` 换成真实值
+   后执行 `pnpm deploy`，部署完成后还原占位符；或复制一份**不提交**的
+   `worker/wrangler.production.toml`，填入真实 ID 后执行
+   `cd worker && npx wrangler deploy --config wrangler.production.toml`；
+3. KV namespace ID 仍需单独填写（共享 D1 不影响 KV）；
+4. 不要把真实 account ID / database ID 提交到仓库。
+
+有 `admin:org` 权限时，可以从组织变量生成临时配置（KV id 仍需手动替换）：
+
+```bash
+D1_ID=$(gh variable get D1_DATABASE_ID --org WorkerHub)
+ACCOUNT_ID=$(gh variable get CLOUDFLARE_ACCOUNT_ID --org WorkerHub)
+sed -e "s/CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER/${ACCOUNT_ID}/" \
+    -e "s/D1_DATABASE_ID_PLACEHOLDER/${D1_ID}/" \
+    worker/wrangler.toml > worker/wrangler.production.toml
+# 把 worker/wrangler.production.toml 里的 KV_NAMESPACE_ID_PLACEHOLDER
+# 替换成真实 KV id，然后：
+cd worker && npx wrangler deploy --config wrangler.production.toml
+rm wrangler.production.toml
+```
+
+`database_name` 只是创建/展示用的名称，实际绑定以 `database_id` 为准。
+
+### 8.5 本轮验证
+
+- `python -m unittest discover -s tests`：通过；
+- `python tools/local_e2e.py`：通过；
+- `pnpm test:worker`、`pnpm --filter worker typecheck`、`pnpm build`：通过；
+- `TABLE_PREFIX=YL` 生成 schema 与 seed，检查到 `YL_*` 表名且无
+  `{prefix}` 残留；
+- 未对生产 D1 执行任何写入；组织级变量/密钥名称因权限不足未能从 CLI 核验，
+  已在 5.2 说明。

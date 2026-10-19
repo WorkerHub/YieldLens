@@ -46,10 +46,15 @@ jobs:
       - name: Run dividend + fundamentals collector
         working-directory: python-collector
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
+          # Organization-level shared configuration (inherited by this repo).
+          # D1_DATABASE_ID is the org variable name; the collector expects the
+          # CLOUDFLARE_* environment names below.
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          TABLE_PREFIX: ${{ vars.TABLE_PREFIX }}
+          # Fixed per-project prefix on the shared D1 database. Keep it in sync
+          # with worker/wrangler.toml [vars] TABLE_PREFIX.
+          TABLE_PREFIX: "YL"
           COLLECT_MODE: ${{ github.event.inputs.mode || 'daily' }}
           # Only inject the backfill window in backfill mode; an empty value
           # keeps daily runs from logging a misleading "ignores ..." message.

@@ -16,6 +16,8 @@ test("normalizeTablePrefix mirrors the Worker and Python rules", () => {
   assert.equal(normalizeTablePrefix("   "), "");
   assert.equal(normalizeTablePrefix("yl"), "yl_");
   assert.equal(normalizeTablePrefix("yl_"), "yl_");
+  assert.equal(normalizeTablePrefix("YL"), "YL_");
+  assert.equal(normalizeTablePrefix("YL_"), "YL_");
   assert.equal(normalizeTablePrefix("_tenant"), "_tenant_");
 });
 
