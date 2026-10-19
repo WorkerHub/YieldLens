@@ -32,10 +32,41 @@ class TestCollectorWorkflows(unittest.TestCase):
         self.assertIn("concurrency:", text)
 
     def test_workflows_request_only_read_permission(self):
-        for name in ("collect-prices.yml", "collect-dividends.yml"):
+        for name in ("collect-prices.yml", "collect-dividends.yml", "apply-schema.yml"):
             text = (WORKFLOWS / name).read_text(encoding="utf-8")
             self.assertIn("permissions:", text)
             self.assertIn("contents: read", text)
+
+    def test_collectors_use_org_level_shared_configuration(self):
+        for name in ("collect-prices.yml", "collect-dividends.yml"):
+            text = (WORKFLOWS / name).read_text(encoding="utf-8")
+            self.assertIn(
+                "CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}", text
+            )
+            # Organization variable is D1_DATABASE_ID, not CLOUDFLARE_D1_DATABASE_ID.
+            self.assertIn("CLOUDFLARE_D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}", text)
+            self.assertNotIn(
+                "CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}", text
+            )
+            self.assertIn(
+                "CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}", text
+            )
+            # The shared database uses the project prefix YL by default.
+            self.assertIn('TABLE_PREFIX: "YL"', text)
+            self.assertNotIn("vars.TABLE_PREFIX", text)
+
+    def test_apply_schema_workflow_is_manual_idempotent_and_never_seeds(self):
+        text = (WORKFLOWS / "apply-schema.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", text)
+        self.assertIn('default: "YL"', text)
+        self.assertIn("vars.CLOUDFLARE_ACCOUNT_ID", text)
+        self.assertIn("vars.D1_DATABASE_ID", text)
+        self.assertIn("secrets.CLOUDFLARE_API_TOKEN", text)
+        self.assertIn("tools/apply_schema.py", text)
+        self.assertIn("dry_run", text)
+        # Production schema application must never load sample data.
+        self.assertNotIn("db:seed", text)
+        self.assertNotIn("--file", text)
 
 
 if __name__ == "__main__":

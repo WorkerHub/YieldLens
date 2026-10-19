@@ -52,10 +52,11 @@ pnpm install
 
 ```bash
 cd worker
-pnpm db:migrate:local   # 建表
+pnpm db:migrate:local   # 建表（默认读取 wrangler.toml 的 TABLE_PREFIX=YL）
 pnpm db:seed:local      # 灌入样例数据（15只代表性股票，含10年模拟历史数据）
 
-# 使用非空表前缀时，建表和 seed 也必须带同一个前缀：
+# 默认表名为 YL_stocks / YL_stock_prices / ...；
+# 如需临时改用其他前缀，建表和 seed 必须带同一个值：
 TABLE_PREFIX=yl pnpm db:migrate:local
 TABLE_PREFIX=yl pnpm db:seed:local
 ```
@@ -79,29 +80,57 @@ pnpm typecheck
 
 ## 部署到 Cloudflare
 
-### 1. 创建 Cloudflare 资源
+团队所有项目共用同一个 D1 数据库，YieldLens 使用固定前缀 `YL`，表名为
+`YL_stocks`、`YL_stock_prices`、`YL_dividends`、`YL_dividend_yields`、
+`YL_system_settings`。**不要为 YieldLens 单独创建 D1 数据库。**
+
+### 1. 组织级共享配置
+
+以下配置由 GitHub 组织提供，并需对 YieldLens 仓库可见：
+
+| 类型 | 名称 | 说明 |
+|---|---|---|
+| Variable | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
+| Variable | `D1_DATABASE_ID` | 共享 D1 数据库 ID |
+| Secret | `CLOUDFLARE_API_TOKEN` | 具备 D1 读写权限的 API Token |
+
+采集 workflow 会把 `D1_DATABASE_ID` 映射为 `CLOUDFLARE_D1_DATABASE_ID`，并固定
+`TABLE_PREFIX=YL`。KV 仍需为本项目单独创建：
 
 ```bash
-npx wrangler d1 create yieldlens
 npx wrangler kv namespace create YIELDLENS_KV
 ```
 
-将输出的 `database_id` 和 KV `id` 填入 `worker/wrangler.toml`（或改为通过 CI 变量注入）。
-
 ### 2. 初始化生产数据库
 
+合并到 `main` 后，在 GitHub Actions 中手动运行 **Apply D1 Schema**：
+
+- Actions → **Apply D1 Schema** → **Run workflow**；
+- `prefix` 保持默认 `YL`（`YL` / `YL_` 都表示 `YL_`）；
+- 可选勾选 `dry_run` 只打印语句、不写数据库。
+
+或使用命令行：
+
 ```bash
-cd worker
-pnpm db:migrate:remote
+gh workflow run apply-schema.yml -f prefix=YL
 ```
 
+该 workflow 通过 D1 HTTP API 执行 `worker/src/db/schema.sql`，逐条输出结果，
+可重复运行，且不会执行 `seed.sql`。
+
 ### 3. 部署
+
+组织级 variables 不会自动替换 `wrangler.toml` 的占位符，部署前仍需把共享
+数据库的 `database_id`（以及 `account_id`、KV `id`）填入本地
+`worker/wrangler.toml`，或复制一份不提交的 `wrangler.production.toml` 后用
+`npx wrangler deploy --config wrangler.production.toml`。`database_name` 只是
+展示名称，实际绑定以 `database_id` 为准。
 
 ```bash
 pnpm deploy
 ```
 
-首次部署后，`worker/wrangler.toml` 中的 `account_id`、`database_id`、KV `id` 需要替换为真实值（当前为占位符，避免误提交敏感信息）。
+当前仓库保留占位符，避免误提交真实 ID。
 
 ## 数据采集
 
@@ -140,23 +169,20 @@ python -m unittest discover -s tests
 
 ### 配置 GitHub Actions
 
-在仓库 Settings → Secrets and variables → Actions 中添加：
+两个采集 workflow 使用组织级共享配置（见上文“部署到 Cloudflare”）：
 
-| Secret | 说明 |
-|---|---|
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
-| `CLOUDFLARE_D1_DATABASE_ID` | D1 数据库 ID |
-| `CLOUDFLARE_API_TOKEN` | 需要 D1 读写权限的 API Token |
+| 类型 | 名称 | 说明 |
+|---|---|---|
+| 组织级 Variable | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID |
+| 组织级 Variable | `D1_DATABASE_ID` | 共享 D1 数据库 ID |
+| 组织级 Secret | `CLOUDFLARE_API_TOKEN` | 需要 D1 读写权限的 API Token |
 
-在 Variables 中添加（可选）：
+`TABLE_PREFIX` 不读取组织级变量：两个采集 workflow 固定为 `YL`，与
+`worker/wrangler.toml` 的 `[vars] TABLE_PREFIX = "YL"` 保持一致。
 
-| Variable | 说明 |
-|---|---|
-| `TABLE_PREFIX` | 数据库表前缀，需与 `worker/wrangler.toml` 中的一致，默认为空 |
+三个 workflow 合并到默认分支（`main`）后生效：
 
-两个 workflow 合并到默认分支（`main`）后按各自的 cron 调度运行（cron 不会在
-普通 push 时触发）：
-
+- `.github/workflows/apply-schema.yml` — 手动执行生产建表（默认前缀 `YL`）
 - `.github/workflows/collect-prices.yml` — 交易时段内每 30 分钟采集全市场快照，
   15:10 / 15:40 强制覆盖收盘价
 - `.github/workflows/collect-dividends.yml` — 每日收盘后采集分红与基本面数据
@@ -165,9 +191,15 @@ python -m unittest discover -s tests
 Collect Stock Prices → Enable workflow** 重新启用（或执行
 `gh workflow enable collect-prices.yml`）。
 
-首次上线需要手动触发一次全量历史回填：分红任务选择 `mode=backfill`；股价任务
-选择 `mode=backfill`，重复运行直到 `system_settings.price_backfill_completed_at`
-有值。完整步骤见 [docs/collector-fix-notes.md](./docs/collector-fix-notes.md)。
+首次上线顺序：
+
+1. **建表**：Actions → **Apply D1 Schema** → `prefix=YL`；
+2. **分红/基本面回填**：**Collect Dividends and Fundamentals** →
+   `mode=backfill`，`backfill_periods=20`；
+3. **股价历史回填**：**Collect Stock Prices** → `mode=backfill`，重复运行直到
+   `YL_system_settings.price_backfill_completed_at` 有值。
+
+完整步骤见 [docs/collector-fix-notes.md](./docs/collector-fix-notes.md)。
 
 ## 已知限制
 

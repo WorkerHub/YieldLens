@@ -52,8 +52,13 @@ pnpm install
 
 ```bash
 cd worker
-pnpm db:migrate:local   # create tables
+pnpm db:migrate:local   # create tables (uses TABLE_PREFIX=YL from wrangler.toml)
 pnpm db:seed:local      # load sample data (15 representative stocks with 10 years of simulated history)
+
+# Default table names are YL_stocks / YL_stock_prices / ...;
+# to try a different prefix locally, pass the same value to both commands:
+TABLE_PREFIX=yl pnpm db:migrate:local
+TABLE_PREFIX=yl pnpm db:seed:local
 ```
 
 ### 3. Start the dev servers
@@ -75,29 +80,64 @@ pnpm typecheck
 
 ## Deploying to Cloudflare
 
-### 1. Create Cloudflare resources
+All team projects share one D1 database. YieldLens uses the fixed prefix `YL`,
+so its tables are `YL_stocks`, `YL_stock_prices`, `YL_dividends`,
+`YL_dividend_yields`, and `YL_system_settings`. **Do not create a separate D1
+database for YieldLens.**
+
+### 1. Organization-level shared configuration
+
+These are provided by the GitHub organization and must be visible to the
+YieldLens repository:
+
+| Type | Name | Purpose |
+|---|---|---|
+| Variable | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID |
+| Variable | `D1_DATABASE_ID` | Shared D1 database ID |
+| Secret | `CLOUDFLARE_API_TOKEN` | API token with D1 read/write access |
+
+The collector workflows map `D1_DATABASE_ID` to
+`CLOUDFLARE_D1_DATABASE_ID` and pin `TABLE_PREFIX=YL`. KV is still
+project-specific:
 
 ```bash
-npx wrangler d1 create yieldlens
 npx wrangler kv namespace create YIELDLENS_KV
 ```
 
-Fill the resulting `database_id` and KV `id` into `worker/wrangler.toml` (or inject them via CI variables instead).
-
 ### 2. Initialize the production database
 
+After the changes are on `main`, run **Apply D1 Schema** manually from GitHub
+Actions:
+
+- Actions → **Apply D1 Schema** → **Run workflow**;
+- keep `prefix` at its default `YL` (`YL` and `YL_` both mean `YL_`);
+- optionally enable `dry_run` to print statements without writing.
+
+Or from the command line:
+
 ```bash
-cd worker
-pnpm db:migrate:remote
+gh workflow run apply-schema.yml -f prefix=YL
 ```
 
+The workflow executes `worker/src/db/schema.sql` through the D1 HTTP API,
+prints a result for every statement, is safe to re-run, and never applies
+`seed.sql`.
+
 ### 3. Deploy
+
+Organization variables are not substituted into `wrangler.toml`, so the Worker
+still needs the shared `database_id` before deployment. Fill the real
+`account_id`, `database_id`, and KV `id` into `worker/wrangler.toml` locally,
+or copy it to an untracked `wrangler.production.toml` and run
+`npx wrangler deploy --config wrangler.production.toml`. `database_name` is
+display-only; the binding is driven by `database_id`.
 
 ```bash
 pnpm deploy
 ```
 
-Before deploying, replace the placeholder `account_id`, `database_id`, and KV `id` in `worker/wrangler.toml` with real values (they're placeholders by default to avoid committing sensitive info).
+The repository keeps placeholders in `wrangler.toml` to avoid committing real
+IDs.
 
 ## Data Collection
 
@@ -134,32 +174,37 @@ python -m unittest discover -s tests
 
 ### Configure GitHub Actions
 
-Add these to your repo's Settings → Secrets and variables → Actions → Secrets:
+Both collector workflows use the organization-level shared configuration
+described in “Deploying to Cloudflare”:
 
-| Secret | Description |
-|---|---|
-| `CLOUDFLARE_ACCOUNT_ID` | Your Cloudflare account ID |
-| `CLOUDFLARE_D1_DATABASE_ID` | D1 database ID |
-| `CLOUDFLARE_API_TOKEN` | API Token with D1 read/write permissions |
+| Type | Name | Purpose |
+|---|---|---|
+| Org Variable | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID |
+| Org Variable | `D1_DATABASE_ID` | Shared D1 database ID |
+| Org Secret | `CLOUDFLARE_API_TOKEN` | API token with D1 read/write access |
 
-Add this to Variables (optional):
+`TABLE_PREFIX` is deliberately not read from an organization variable: both
+collector workflows pin it to `YL`, matching
+`worker/wrangler.toml`'s `[vars] TABLE_PREFIX = "YL"`.
 
-| Variable | Description |
-|---|---|
-| `TABLE_PREFIX` | Database table prefix, must match `worker/wrangler.toml`; defaults to empty |
+Three workflows take effect once the changes are on the default branch
+(`main`):
 
-Two workflows run on their own cron schedules once the changes are on the
-default branch (`main`); cron does not fire on a normal push:
-
+- `.github/workflows/apply-schema.yml` — manual production schema application (default prefix `YL`)
 - `.github/workflows/collect-prices.yml` — full-market snapshot every 30 minutes during trading hours, with forced close-price runs at 15:10 / 15:40
 - `.github/workflows/collect-dividends.yml` — dividends and fundamentals daily after market close
 
 If `Collect Stock Prices` was disabled, open **Actions → Collect Stock Prices →
 Enable workflow** (or run `gh workflow enable collect-prices.yml`).
 
-A one-time manual full historical backfill is needed before launch: run the
-dividend workflow with `mode=backfill`, and the price workflow with
-`mode=backfill` until `system_settings.price_backfill_completed_at` is set.
+First-launch order:
+
+1. **Create tables**: Actions → **Apply D1 Schema** → `prefix=YL`;
+2. **Dividend/fundamental backfill**: **Collect Dividends and Fundamentals** →
+   `mode=backfill`, `backfill_periods=20`;
+3. **Price history backfill**: **Collect Stock Prices** → `mode=backfill`,
+   re-run until `YL_system_settings.price_backfill_completed_at` is set.
+
 See [docs/collector-fix-notes.md](./docs/collector-fix-notes.md) for details.
 
 ## Known Limitations

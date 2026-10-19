@@ -21,4 +21,6 @@ binding = "KV"
 id = "KV_NAMESPACE_ID_PLACEHOLDER"
 
 [vars]
-TABLE_PREFIX = ""
+# Shared D1 database: every project owns a distinct table prefix.
+# Must match TABLE_PREFIX in the collector workflows and the apply-schema input.
+TABLE_PREFIX = "YL"
