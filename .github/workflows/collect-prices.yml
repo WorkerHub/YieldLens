@@ -47,8 +47,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  collect:
+  # The repository is public: contributor-controlled events (a pull_request in
+  # particular) must never reach the team's machine. The collector job below is
+  # skipped for them; this GitHub-hosted job turns the run red with an explicit
+  # message instead of leaving it silently skipped.
+  reject-untrusted:
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
+    steps:
+      - name: Refuse untrusted event
+        run: |
+          echo "::error::Refusing to run the self-hosted collector for event '${{ github.event_name }}'; only schedule and workflow_dispatch are allowed."
+          exit 1
+
+  collect:
+    # This job runs on the team's own machine (P3685.local), where the upstream
+    # sites are reachable. Only trusted events may reach that runner: `schedule`
+    # always runs the default branch's workflow, and `workflow_dispatch`
+    # requires write access. The condition is evaluated before a runner is
+    # assigned, so untrusted code never executes on it.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, yieldlens]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4

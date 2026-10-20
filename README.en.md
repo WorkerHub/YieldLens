@@ -194,6 +194,12 @@ Three workflows take effect once the changes are on the default branch
 - `.github/workflows/collect-prices.yml` — full-market snapshot every 30 minutes during trading hours, with forced close-price runs at 15:10 / 15:40
 - `.github/workflows/collect-dividends.yml` — dividends and fundamentals daily after market close
 
+Both collector workflows run on the team's self-hosted runner
+(`runs-on: [self-hosted, yieldlens]`, machine `P3685.local`); the schema
+workflow stays on a GitHub-hosted runner. Installation, service management,
+the public-repository guard and troubleshooting are documented in
+[docs/self-hosted-runner.md](./docs/self-hosted-runner.md).
+
 If `Collect Stock Prices` was disabled, open **Actions → Collect Stock Prices →
 Enable workflow** (or run `gh workflow enable collect-prices.yml`).
 
