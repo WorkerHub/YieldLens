@@ -70,6 +70,29 @@ jobs:
   只显示一个「skipped」让人误以为没事；
 - `apply-schema.yml` 保持 `runs-on: ubuntu-latest`。
 
+### Python 环境（自建 runner 专用）
+
+两个采集 job 不再使用 `actions/setup-python`：该 action 在 macOS 上把工具缓存
+硬编码成 `/Users/runner/hostedtoolcache`（v5–v7 都一样），自建 runner 以普通用户
+`mapan` 运行时无法创建 `/Users/runner`，安装步骤会直接失败：
+
+```
+##[error]mkdir: /Users/runner: Permission denied
+```
+
+改为使用机器上已有的 `uv`（`~/.local/bin/uv`，已在 runner 的 `.path` 里）：
+
+```bash
+uv venv --python 3.11 .venv
+echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+uv pip install --python .venv/bin/python -r python-collector/requirements.txt
+```
+
+首次运行会把 CPython 3.11 下载到 `~/.local/share/uv/python`，之后复用；wheel
+缓存位于 `~/.cache/uv`。机器上若没有 `uv`，用
+`curl -LsSf https://astral.sh/uv/install.sh | sh` 安装（job 里也会先检查并给出
+同样的提示）。
+
 ## 安全：公开仓库上的自建 runner
 
 仓库是公开的，自建 runner 绝不能执行外部贡献者可以改动的代码。当前配置：
@@ -113,6 +136,17 @@ gh run list --workflow=collect-dividends.yml --limit 3
 gh run list --workflow=collect-prices.yml --limit 3
 gh run view <run-id> --log
 ```
+
+首次尝试记录（分支 `tds/conv-01a158dc-…`，commit `d400142`）：
+
+| 运行 | run id | 结果 | 耗时 | 说明 |
+|---|---|---|---|---|
+| 分红 #1 | 39409808041 | ❌ | 81s | `actions/setup-python` 失败：`mkdir: /Users/runner: Permission denied` |
+| 分红 #2 | 39410122170 | ❌ | 89s | 同上；runner `.env` 里加 `RUNNER_TOOL_CACHE` 无效，action 会覆盖 |
+| 分红 #3 | 39410447975 | ❌ | 81s | 同上；加 `AGENT_TOOLSDIRECTORY` 也无效（见「Python 环境」） |
+
+三次运行都确认 job 落在 `P3685-yieldlens` 上（`reject-untrusted` 正常 skipped），
+失败点只在 Python 安装步骤。改用 `uv` 后的验证记录补充到下面。
 
 判读标准：
 

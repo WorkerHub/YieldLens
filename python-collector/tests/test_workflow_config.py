@@ -47,7 +47,12 @@ class TestCollectorWorkflows(unittest.TestCase):
             # the self-hosted runner is never assigned.
             self.assertIn("reject-untrusted:", text)
             self.assertIn("Refusing to run the self-hosted collector", text)
+            # The reject job must stay on a GitHub-hosted runner.
             self.assertIn("runs-on: ubuntu-latest", text)
+            # setup-python hardcodes /Users/runner/hostedtoolcache on macOS
+            # (v5-v7), so the self-hosted job provisions CPython through uv.
+            self.assertIn("uv venv --python 3.11", text)
+            self.assertNotIn("uses: actions/setup-python", text)
 
     def test_schema_workflow_stays_on_github_hosted_runner(self):
         text = (WORKFLOWS / "apply-schema.yml").read_text(encoding="utf-8")
