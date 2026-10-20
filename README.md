@@ -187,6 +187,10 @@ python -m unittest discover -s tests
   15:10 / 15:40 强制覆盖收盘价
 - `.github/workflows/collect-dividends.yml` — 每日收盘后采集分红与基本面数据
 
+两个采集 workflow 运行在团队自建 runner 上（`runs-on: [self-hosted, yieldlens]`，
+机器 `P3685.local`），建表 workflow 仍使用 GitHub 托管 runner。安装位置、服务
+管理、公开仓库的安全守卫与排障见 [docs/self-hosted-runner.md](./docs/self-hosted-runner.md)。
+
 如果 `Collect Stock Prices` 在 Actions 页面被禁用，打开 **Actions → 左侧
 Collect Stock Prices → Enable workflow** 重新启用（或执行
 `gh workflow enable collect-prices.yml`）。

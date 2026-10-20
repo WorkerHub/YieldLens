@@ -1,9 +1,12 @@
 name: Collect Stock Prices
 
-# A-share trading hours are 09:30-15:00 Beijing time (UTC+8). Intraday runs
-# every 30 minutes take one full-market snapshot; the 15:10 run switches to
-# "close" mode, which always re-fetches and overwrites today's row with the
-# final closing price. GitHub cron is best-effort, so runs can be delayed.
+# A-share trading hours are 09:30-15:00 Beijing time (UTC+8). Four runs a day
+# take one full-market snapshot each; the 15:10 run switches to "close" mode,
+# which always re-fetches and overwrites today's row with the final closing
+# price. The cadence is deliberately capped at four runs: each snapshot writes
+# ~11k rows, and the D1 free plan allows 100k rows written per day (account
+# wide, shared with the dividend job). GitHub cron is best-effort, so runs can
+# be delayed.
 #
 # Throughput: the snapshot path is a single upstream call for the whole market
 # and fits comfortably in the 25-minute job limit. If that endpoint is down,
@@ -11,18 +14,10 @@ name: Collect Stock Prices
 # cursor stored in system_settings (PRICE_BATCH_SIZE stocks per shard).
 on:
   schedule:
-    - cron: "30 1 * * 1-5"  # 09:30 CST
     - cron: "0 2 * * 1-5"   # 10:00 CST
-    - cron: "30 2 * * 1-5"  # 10:30 CST
-    - cron: "0 3 * * 1-5"   # 11:00 CST
     - cron: "30 3 * * 1-5"  # 11:30 CST
-    # lunch break 11:30-13:00 CST — no runs
-    - cron: "0 5 * * 1-5"   # 13:00 CST
-    - cron: "30 5 * * 1-5"  # 13:30 CST
     - cron: "0 6 * * 1-5"   # 14:00 CST
-    - cron: "30 6 * * 1-5"  # 14:30 CST
     - cron: "10 7 * * 1-5"  # 15:10 CST — closing prices
-    - cron: "40 7 * * 1-5"  # 15:40 CST — closing-price retry
   workflow_dispatch:
     inputs:
       mode:
@@ -47,19 +42,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  collect:
+  # The repository is public: contributor-controlled events (a pull_request in
+  # particular) must never reach the team's machine. The collector job below is
+  # skipped for them; this GitHub-hosted job turns the run red with an explicit
+  # message instead of leaving it silently skipped.
+  reject-untrusted:
+    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
+    steps:
+      - name: Refuse untrusted event
+        run: |
+          echo "::error::Refusing to run the self-hosted collector for event '${{ github.event_name }}'; only schedule and workflow_dispatch are allowed."
+          exit 1
+
+  collect:
+    # This job runs on the team's own machine (P3685.local), where the upstream
+    # sites are reachable. Only trusted events may reach that runner: `schedule`
+    # always runs the default branch's workflow, and `workflow_dispatch`
+    # requires write access. The condition is evaluated before a runner is
+    # assigned, so untrusted code never executes on it.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, yieldlens]
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: python-collector/requirements.txt
-
-      - run: pip install -r python-collector/requirements.txt
+      # actions/setup-python hardcodes /Users/runner/hostedtoolcache on macOS
+      # (v5 through v7), a path a self-hosted runner running as a normal user
+      # cannot create. uv manages its own CPython 3.11 under ~/.local/share/uv
+      # and caches wheels in ~/.cache/uv, so repeat runs stay fast.
+      - name: Set up Python 3.11
+        run: |
+          command -v uv >/dev/null || { echo "::error::uv is required on the self-hosted runner (install: curl -LsSf https://astral.sh/uv/install.sh | sh)"; exit 1; }
+          uv venv --python 3.11 .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          uv pip install --python .venv/bin/python -r python-collector/requirements.txt
 
       - name: Run price collector
         working-directory: python-collector

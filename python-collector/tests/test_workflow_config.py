@@ -31,6 +31,34 @@ class TestCollectorWorkflows(unittest.TestCase):
         self.assertIn("github.event.inputs.mode == 'backfill'", text)
         self.assertIn("concurrency:", text)
 
+    def test_collector_workflows_run_on_the_self_hosted_runner(self):
+        for name in ("collect-prices.yml", "collect-dividends.yml"):
+            text = (WORKFLOWS / name).read_text(encoding="utf-8")
+            self.assertIn("runs-on: [self-hosted, yieldlens]", text)
+            self.assertNotIn("jobs:\n  collect:\n    runs-on: ubuntu-latest", text)
+            # The repository is public: contributor-controlled events must never
+            # reach the team's own machine.
+            self.assertNotIn("pull_request:", text)
+            self.assertIn(
+                "if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+                text,
+            )
+            # Anything else fails on a GitHub-hosted job, so the run is red and
+            # the self-hosted runner is never assigned.
+            self.assertIn("reject-untrusted:", text)
+            self.assertIn("Refusing to run the self-hosted collector", text)
+            # The reject job must stay on a GitHub-hosted runner.
+            self.assertIn("runs-on: ubuntu-latest", text)
+            # setup-python hardcodes /Users/runner/hostedtoolcache on macOS
+            # (v5-v7), so the self-hosted job provisions CPython through uv.
+            self.assertIn("uv venv --python 3.11", text)
+            self.assertNotIn("uses: actions/setup-python", text)
+
+    def test_schema_workflow_stays_on_github_hosted_runner(self):
+        text = (WORKFLOWS / "apply-schema.yml").read_text(encoding="utf-8")
+        self.assertIn("runs-on: ubuntu-latest", text)
+        self.assertNotIn("self-hosted", text)
+
     def test_workflows_request_only_read_permission(self):
         for name in ("collect-prices.yml", "collect-dividends.yml", "apply-schema.yml"):
             text = (WORKFLOWS / name).read_text(encoding="utf-8")
