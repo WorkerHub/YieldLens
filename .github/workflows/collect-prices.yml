@@ -1,9 +1,12 @@
 name: Collect Stock Prices
 
-# A-share trading hours are 09:30-15:00 Beijing time (UTC+8). Intraday runs
-# every 30 minutes take one full-market snapshot; the 15:10 run switches to
-# "close" mode, which always re-fetches and overwrites today's row with the
-# final closing price. GitHub cron is best-effort, so runs can be delayed.
+# A-share trading hours are 09:30-15:00 Beijing time (UTC+8). Four runs a day
+# take one full-market snapshot each; the 15:10 run switches to "close" mode,
+# which always re-fetches and overwrites today's row with the final closing
+# price. The cadence is deliberately capped at four runs: each snapshot writes
+# ~11k rows, and the D1 free plan allows 100k rows written per day (account
+# wide, shared with the dividend job). GitHub cron is best-effort, so runs can
+# be delayed.
 #
 # Throughput: the snapshot path is a single upstream call for the whole market
 # and fits comfortably in the 25-minute job limit. If that endpoint is down,
@@ -11,18 +14,10 @@ name: Collect Stock Prices
 # cursor stored in system_settings (PRICE_BATCH_SIZE stocks per shard).
 on:
   schedule:
-    - cron: "30 1 * * 1-5"  # 09:30 CST
     - cron: "0 2 * * 1-5"   # 10:00 CST
-    - cron: "30 2 * * 1-5"  # 10:30 CST
-    - cron: "0 3 * * 1-5"   # 11:00 CST
     - cron: "30 3 * * 1-5"  # 11:30 CST
-    # lunch break 11:30-13:00 CST — no runs
-    - cron: "0 5 * * 1-5"   # 13:00 CST
-    - cron: "30 5 * * 1-5"  # 13:30 CST
     - cron: "0 6 * * 1-5"   # 14:00 CST
-    - cron: "30 6 * * 1-5"  # 14:30 CST
     - cron: "10 7 * * 1-5"  # 15:10 CST — closing prices
-    - cron: "40 7 * * 1-5"  # 15:40 CST — closing-price retry
   workflow_dispatch:
     inputs:
       mode:
