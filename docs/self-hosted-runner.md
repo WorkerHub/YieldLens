@@ -146,7 +146,52 @@ gh run view <run-id> --log
 | 分红 #3 | 39410447975 | ❌ | 81s | 同上；加 `AGENT_TOOLSDIRECTORY` 也无效（见「Python 环境」） |
 
 三次运行都确认 job 落在 `P3685-yieldlens` 上（`reject-untrusted` 正常 skipped），
-失败点只在 Python 安装步骤。改用 `uv` 后的验证记录补充到下面。
+失败点只在 Python 安装步骤。
+
+改用 `uv` 后（commit `1e9c6b5`）：
+
+| 运行 | run id | 结果 | 耗时 | 关键日志 |
+|---|---|---|---|---|
+| 分红 | [39411205543](https://github.com/WorkerHub/YieldLens/actions/runs/39411205543) | ❌ | 36s | Python 3.11 安装成功；3 个报告期取数成功；全部写入被 D1 拒绝（`code 7500`，免费额度用尽） |
+| 股价 | [39411541549](https://github.com/WorkerHub/YieldLens/actions/runs/39411541549) | ❌ | 64s | `Loaded 5575 A-share codes`；快照 3 次尝试全失败 → 回退逐股（000701… 取数成功）；逐股写入与 checkpoint 均被 `code 7500` 拒绝 |
+
+这两次已经证明：runner、标签、uv/Python 3.11、org 级变量与 secret 注入、D1 读
+路径（5575 只股票、交易日历、游标查询）都正常。剩下的失败只有一个原因：
+**D1 免费套餐当天的写入行数已用尽**。
+
+### D1 每日写入额度（阻塞项）
+
+错误原文：
+
+```
+code 7500: Your account has exceeded D1's free tier daily row write limit.
+Upgrade to a paid plan or wait until tomorrow (midnight UTC) to continue.
+```
+
+- 额度是**账号级**的（同账号下所有项目共用），每天 00:00 UTC（北京 08:00）重置；
+- 单次全市场快照写入 ≈ 5575 行 `YL_stock_prices` + 5575 行 `YL_stocks.last_price`
+  ≈ **1.1 万行**（`YL_stock_prices` 上还有二级索引，按 D1 的计费口径实际行数更高）；
+- 当前 cron 一天 12 次快照 ≈ **13.4 万行起**，再加分红/基本面每日约 0.6 万行，
+  超过免费额度（Workers Free：10 万行/天，00:00 UTC 重置）——即使额度是满的，
+  下午的几轮（包括 15:10 收盘那轮）也会被拒绝；
+- 因此「切换 runner」本身已经完成，但**采集节奏与 D1 套餐需要一起定**，否则每天
+  都会在后半段失败。
+
+可选方案：
+
+1. 降低盘中快照频率（例如 10:00 / 11:30 / 14:00 / 15:10 四次 ≈ 4.5 万行/天），
+   不动代码，收盘那轮永远有额度；
+2. 升级到 Workers Paid（D1 付费额度足够跑满 12 次）；
+3. 改采集器只写「价格有变化」的行（保留 12 次节奏，但要改 `write_spot_snapshot`
+   的写入策略，属于代码改动）。
+
+### 上游快照现状
+
+2026-10-20 18:59 CST 再次探测 `82.push2.eastmoney.com`：仍然 `Empty reply`，
+新浪接口 200。也就是说本机直连出口对东方财富实时行情接口**仍处于限流状态**，
+采集会走逐股回退（本次已确认回退能正常取数，只是写不进去）。回退模式下每轮覆盖
+`PRICE_BATCH_SIZE=600` 只，5575 只需要约 10 轮才能轮完一遍，收盘价精度会下降；
+若长期如此，需要给快照接口准备备用数据源（另开任务）。
 
 判读标准：
 
@@ -199,11 +244,14 @@ SELECT COUNT(*) FROM YL_dividends;
 
 1. **首次登录后的后台项目批准**：若 macOS 提示「已添加后台项目」，打开
    系统设置 → 通用 → 登录项，允许 `actions.runner.WorkerHub-YieldLens.P3685-yieldlens`。
-2. **两次真实验证运行**（见上节），确认写入 `YL_stocks.last_price` 与
-   `YL_stock_prices`。
-3. **合并到 `main` 后**确认定时任务生效：Actions 页面里两个采集 workflow 的
+2. **定采集节奏 / D1 套餐**：按上节「D1 每日写入额度」选一个方案（降频、升级
+   D1，或改成只写变化行），否则每天后半段的运行会被额度拒绝。
+3. **额度重置后重跑两次验证**：D1 免费额度在 00:00 UTC（北京 08:00）重置，之后
+   重跑分红与股价两条，确认 `YL_stocks.last_price` 与 `YL_stock_prices` 的实际写入。
+   在此之前不要合并。
+4. **合并到 `main` 后**确认定时任务生效：Actions 页面里两个采集 workflow 的
    下一次 `schedule` 运行应显示 runner 为 `P3685-yieldlens`。
-4. **仓库设置**：按「安全」一节的第 1 条确认外部 PR 需要人工批准。
+5. **仓库设置**：按「安全」一节的第 1 条确认外部 PR 需要人工批准。
 
 ## 升级 / 卸载
 
