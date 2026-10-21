@@ -4,9 +4,9 @@ name: Collect Dividends and Fundamentals
 # recently disclosed report periods; "backfill" mode covers ~10 years and is
 # only started manually from the Actions tab.
 on:
-  schedule:
-    - cron: "0 8 * * 1-5"   # 16:00 CST, weekdays
-    - cron: "0 8 * * 6,0"   # also run weekends to catch weekend announcements
+  # schedule:
+  #   - cron: "0 8 * * 1-5"   # 16:00 CST, weekdays
+  #   - cron: "0 8 * * 6,0"   # also run weekends to catch weekend announcements
   workflow_dispatch:
     inputs:
       mode:
