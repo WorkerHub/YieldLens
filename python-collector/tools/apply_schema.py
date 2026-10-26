@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Apply ``worker/src/db/schema.sql`` to the shared D1 database.
+"""Apply the pending ledger-backed migrations to the shared D1 database.
 
-The script is the production entry point used by
-``.github/workflows/apply-schema.yml``. It:
+``worker/src/db/schema.sql`` is no longer re-applied wholesale on every run:
+it is migration ``schema_v1`` in the manifest of ``common/migrations.py``, and
+each applied migration is recorded in this prefix's ledger table (production
+``YL_`` -> ``_YL_schema_migrations``). This script is the thin production entry
+point used by ``.github/workflows/apply-schema.yml``:
 
 * expands the ``{prefix}`` template with the shared normalisation rule
   (``YL`` and ``YL_`` both become ``YL_``);
-* sends one SQL statement per request through the D1 HTTP API, reusing the
-  authentication/retry/error handling in ``common/d1_client.py``;
-* prints a result line for every statement and keeps going after a failure so
-  one bad statement does not hide the rest, then exits non-zero if any failed;
+* creates the ledger if needed, then applies the unrecorded migrations in
+  manifest order, one SQL statement per request through the D1 HTTP API
+  (reusing the authentication/retry/error handling in ``common/d1_client.py``);
+* prints a result line per statement and **stops at the first failure** — a
+  migration is only recorded after all of its statements succeeded and the
+  shape check passed, so the ledger never claims a half-applied migration;
 * never touches ``worker/seed.sql`` — production must not contain sample data.
 
 Run locally without credentials to inspect the generated SQL:
@@ -29,101 +34,26 @@ REPO_DIR = COLLECTOR_DIR.parent
 sys.path.insert(0, str(COLLECTOR_DIR))
 
 from common.d1_client import D1Client  # noqa: E402
+from common.migrations import (  # noqa: E402
+    MIGRATIONS,
+    MigrationRun,
+    dry_run_statements,
+    ledger_table_name,
+    run_migrations,
+    summarize_statement,
+)
 from common.table_prefix import normalize_table_prefix  # noqa: E402
 
 DEFAULT_PREFIX = "YL"
-DEFAULT_SCHEMA = REPO_DIR / "worker" / "src" / "db" / "schema.sql"
-
-
-def split_sql_statements(sql: str) -> list[str]:
-    """Split a SQL script on semicolons outside strings/comments.
-
-    The schema only uses ``--`` line comments, but tracking quotes keeps the
-    splitter safe if a future statement contains a semicolon in a literal.
-    """
-    statements: list[str] = []
-    buffer: list[str] = []
-    index = 0
-    in_single = False
-    in_double = False
-    length = len(sql)
-
-    while index < length:
-        char = sql[index]
-        following = sql[index + 1] if index + 1 < length else ""
-
-        if not in_single and not in_double and char == "-" and following == "-":
-            # Drop the comment but keep the newline so tokens stay separated.
-            while index < length and sql[index] != "\n":
-                index += 1
-            continue
-
-        if char == "'" and not in_double:
-            if in_single and following == "'":
-                buffer.append("''")
-                index += 2
-                continue
-            in_single = not in_single
-        elif char == '"' and not in_single:
-            if in_double and following == '"':
-                buffer.append('""')
-                index += 2
-                continue
-            in_double = not in_double
-        elif char == ";" and not in_single and not in_double:
-            statement = "".join(buffer).strip()
-            if statement:
-                statements.append(statement)
-            buffer = []
-            index += 1
-            continue
-
-        buffer.append(char)
-        index += 1
-
-    trailing = "".join(buffer).strip()
-    if trailing:
-        statements.append(trailing)
-    return statements
-
-
-def render_schema(template: str, prefix: str) -> list[str]:
-    sql = template.replace("{prefix}", prefix)
-    if "{prefix}" in sql:
-        raise ValueError("schema still contains an unresolved {prefix} placeholder")
-    return split_sql_statements(sql)
-
-
-def summarize_statement(statement: str, limit: int = 140) -> str:
-    flattened = " ".join(statement.split())
-    if len(flattened) <= limit:
-        return flattened
-    return f"{flattened[: limit - 1]}…"
-
-
-def apply_statements(client: D1Client, statements: list[str]) -> int:
-    """Execute statements in order; return the number of failures."""
-    failures = 0
-    total = len(statements)
-
-    for position, statement in enumerate(statements, start=1):
-        label = f"[{position:02d}/{total:02d}]"
-        summary = summarize_statement(statement)
-        try:
-            rows = client.execute_sql(statement)
-        except Exception as exc:  # noqa: BLE001 - report every statement
-            failures += 1
-            print(f"{label} FAIL {summary}", flush=True)
-            print(f"         reason: {exc}", file=sys.stderr, flush=True)
-        else:
-            print(f"{label} OK   {summary} ({len(rows)} row(s))", flush=True)
-
-    return failures
+SCHEMA_V1_PATH = MIGRATIONS[0].path
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Apply worker/src/db/schema.sql to the shared D1 database."
+        description=(
+            "Apply the pending ledger-backed migrations (manifest: "
+            "common/migrations.py) to the shared D1 database."
+        )
     )
     parser.add_argument(
         "--prefix",
@@ -133,8 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--schema",
         type=Path,
-        default=DEFAULT_SCHEMA,
-        help=f"Schema template path (default: {DEFAULT_SCHEMA})",
+        default=None,
+        help=(
+            "Override the file used for the schema_v1 migration (default: the "
+            f"manifest entry {SCHEMA_V1_PATH}); other migrations still come from the manifest"
+        ),
     )
     parser.add_argument(
         "--account-id",
@@ -154,6 +87,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def print_dry_run(prefix: str, schema_override: Path | None) -> int:
+    rendered = dry_run_statements(prefix, schema_override=schema_override)
+    for name, path, statements in rendered:
+        print(f"migration {name}: {path} ({len(statements)} statement(s))")
+        total = len(statements)
+        for position, statement in enumerate(statements, start=1):
+            print(f"[{position:02d}/{total:02d}] DRY  {summarize_statement(statement)}")
+    print(
+        "dry run: ledger state unknown — these are all migrations in the manifest, "
+        "not the set that would actually be applied"
+    )
+    print("dry run: no statements were sent to D1", flush=True)
+    return 0
+
+
+def print_summary(outcome: MigrationRun, ledger: str) -> None:
+    def join(names: tuple[str, ...]) -> str:
+        return ", ".join(names) if names else "(none)"
+
+    print("summary:", flush=True)
+    print(f"  applied : {join(outcome.applied)}")
+    print(f"  skipped : {join(outcome.skipped)}")
+    if outcome.stamped_existing_install:
+        print(
+            f"  stamped : {join(outcome.stamped_existing_install)} "
+            "(existing installation, first ledger stamp)"
+        )
+    if outcome.failed:
+        position = f" (statement {outcome.failed_statement})" if outcome.failed_statement else ""
+        print(f"  failed  : {outcome.failed}{position}")
+        if outcome.missing_tables:
+            print(f"  missing : {', '.join(outcome.missing_tables)}")
+        if outcome.pending:
+            print(f"  pending : {join(outcome.pending)} (not attempted)")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -166,25 +135,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    schema_path = args.schema.expanduser().resolve()
-    if not schema_path.is_file():
-        print(f"error: schema not found: {schema_path}", file=sys.stderr)
-        return 2
+    schema_override: Path | None = None
+    if args.schema is not None:
+        schema_override = args.schema.expanduser().resolve()
+        if not schema_override.is_file():
+            print(f"error: schema not found: {schema_override}", file=sys.stderr)
+            return 2
 
-    try:
-        statements = render_schema(schema_path.read_text(encoding="utf-8"), prefix)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    print(f"schema : {schema_path}")
-    print(f"prefix : {prefix!r} ({len(statements)} statement(s))", flush=True)
+    ledger = ledger_table_name(prefix)
+    print(f"prefix : {prefix!r}")
+    print(f"ledger : {ledger}", flush=True)
 
     if args.dry_run:
-        for position, statement in enumerate(statements, start=1):
-            print(f"[{position:02d}/{len(statements):02d}] DRY  {summarize_statement(statement)}")
-        print("dry run: no statements were sent to D1", flush=True)
-        return 0
+        try:
+            return print_dry_run(prefix, schema_override)
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     try:
         client = D1Client(account_id=args.account_id, database_id=args.database_id)
@@ -196,16 +163,34 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    failures = apply_statements(client, statements)
-    if failures:
+    try:
+        outcome = run_migrations(client, prefix, schema_override=schema_override)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - a failed ledger read/write must not dump a traceback
         print(
-            f"FAILED: {failures} of {len(statements)} statement(s) failed",
+            f"FAILED: could not run migrations against {ledger}: {exc}",
             file=sys.stderr,
             flush=True,
         )
         return 1
 
-    print(f"OK: applied {len(statements)} statement(s) to the shared D1 database", flush=True)
+    print_summary(outcome, ledger)
+    if not outcome.ok:
+        print(
+            f"FAILED: migration {outcome.failed} did not complete; "
+            f"{ledger} was not updated for it",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+
+    print(
+        f"OK: {len(outcome.applied)} migration(s) applied, "
+        f"{len(outcome.skipped)} already recorded ({ledger})",
+        flush=True,
+    )
     return 0
 
 

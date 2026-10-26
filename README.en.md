@@ -106,6 +106,28 @@ npx wrangler kv namespace create YIELDLENS_KV
 
 ### 2. Initialize the production database
 
+The schema is applied through a migration ledger (`schema_migrations`) instead
+of re-running the whole DDL file every time:
+
+- the migration manifest is an **ordered list** in
+  `python-collector/common/migrations.py`; today it holds a single entry,
+  `schema_v1`, whose content is `worker/src/db/schema.sql` unchanged (that file
+  stays where it is);
+- a migration is recorded in this prefix's ledger table only after every one of
+  its statements succeeded and the shape check found all 5 business tables —
+  prefix `YL_` maps to **`_YL_schema_migrations`** (no prefix: `_schema_migrations`);
+- already-recorded migrations are skipped on later runs (no SQL is sent for
+  them); the first failing statement stops the run, that migration is not
+  recorded, later ones are not attempted, and the exit code is non-zero.
+
+Rules for appending a migration: merged migrations are never renamed, edited or
+reordered (databases that ran them will not run them again); a new migration is
+a new SQL file (e.g. `worker/src/db/migrations/schema_v2.sql`) plus one entry
+appended to the manifest; migrations must be additive (`CREATE ... IF NOT
+EXISTS`, `ADD COLUMN`, `INSERT OR IGNORE`), never `DROP`/`RENAME`/data rewrites —
+destructive changes need their own project. SQL files keep the `{prefix}`
+placeholder and `--` line comments.
+
 After the changes are on `main`, run **Apply D1 Schema** manually from GitHub
 Actions:
 
@@ -119,9 +141,25 @@ Or from the command line:
 gh workflow run apply-schema.yml -f prefix=YL
 ```
 
-The workflow executes `worker/src/db/schema.sql` through the D1 HTTP API,
-prints a result for every statement, is safe to re-run, and never applies
-`seed.sql`.
+The workflow walks the manifest through the D1 HTTP API, prints a result for
+every statement, and never applies `seed.sql`. On the **first ledger-based run
+against an existing database**, `schema_v1`'s `CREATE ... IF NOT EXISTS` DDL
+no-ops on the existing tables/indexes — no structure or data change — the output
+says the existing installation is being stamped, and the ledger then records
+`schema_v1`.
+
+The same script runs locally (needs `CLOUDFLARE_ACCOUNT_ID` /
+`CLOUDFLARE_D1_DATABASE_ID` / `CLOUDFLARE_API_TOKEN`):
+
+```bash
+cd python-collector
+python tools/apply_schema.py --prefix YL             # apply for real
+python tools/apply_schema.py --prefix YL --dry-run   # print only, no D1 call
+```
+
+`--dry-run` works offline and prints every statement of **every** migration in
+the manifest; the ledger state is unknown in that mode, so those are not
+necessarily the statements that would actually be executed.
 
 ### 3. Deploy
 
