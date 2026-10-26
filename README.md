@@ -103,6 +103,22 @@ npx wrangler kv namespace create YIELDLENS_KV
 
 ### 2. 初始化生产数据库
 
+schema 以「迁移账本」（`schema_migrations`）方式应用，不再每次重刷整份 DDL：
+
+- 迁移清单固定在 `python-collector/common/migrations.py` 的**有序列表**里，当前只有
+  一条 `schema_v1`，其内容就是 `worker/src/db/schema.sql` 全文（该文件原地不动）；
+- 每条迁移只有在其全部语句执行成功、且渲染前缀下 5 张业务表验形通过后，才记录进本
+  前缀的账本表——生产前缀 `YL_` 对应 **`_YL_schema_migrations`**，无前缀时是
+  `_schema_migrations`；
+- 已记录的迁移再次运行会被跳过（一条 SQL 都不发）；任一语句失败立即停止，该迁移不
+  记账、后续迁移不执行，退出码非零。
+
+追加新迁移的规矩：已合并的迁移永不改名 / 改内容 / 重排序（已记账的库不会重跑）；
+新增迁移＝新增 SQL 文件（如 `worker/src/db/migrations/schema_v2.sql`）+ 在清单末尾追加
+一条；迁移必须可加性（`CREATE ... IF NOT EXISTS`、`ADD COLUMN`、`INSERT OR IGNORE`），
+不做 DROP / RENAME / 数据重写，破坏性变更另行立项。SQL 文件继续使用 `{prefix}` 占位
+与 `--` 行注释。
+
 合并到 `main` 后，在 GitHub Actions 中手动运行 **Apply D1 Schema**：
 
 - Actions → **Apply D1 Schema** → **Run workflow**；
@@ -115,8 +131,22 @@ npx wrangler kv namespace create YIELDLENS_KV
 gh workflow run apply-schema.yml -f prefix=YL
 ```
 
-该 workflow 通过 D1 HTTP API 执行 `worker/src/db/schema.sql`，逐条输出结果，
-可重复运行，且不会执行 `seed.sql`。
+该 workflow 通过 D1 HTTP API 按清单逐条执行迁移，逐句输出结果，且不会执行
+`seed.sql`。**存量库第一次以账本制运行**时，`schema_v1` 的 DDL 全是
+`CREATE ... IF NOT EXISTS`，对已有表/索引空转、不改结构不动数据，输出会标明「存量库
+首次打戳」，随后账本记入 `schema_v1`。
+
+本地也可以直接跑（需要 `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_D1_DATABASE_ID` /
+`CLOUDFLARE_API_TOKEN`）：
+
+```bash
+cd python-collector
+python tools/apply_schema.py --prefix YL               # 真实执行
+python tools/apply_schema.py --prefix YL --dry-run     # 只打印语句，不连 D1
+```
+
+`--dry-run` 离线可用，打印的是清单内**全部**迁移的语句；此时账本状态未知，
+不代表将实际执行的集合。
 
 ### 3. 部署
 

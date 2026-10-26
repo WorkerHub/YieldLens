@@ -92,6 +92,10 @@ class TestCollectorWorkflows(unittest.TestCase):
         self.assertIn("secrets.CLOUDFLARE_API_TOKEN", text)
         self.assertIn("tools/apply_schema.py", text)
         self.assertIn("dry_run", text)
+        # The header comment documents the ledger-based behaviour (inputs,
+        # trigger and credential source stay unchanged).
+        self.assertIn("common/migrations.py", text)
+        self.assertIn("_YL_schema_migrations", text)
         # Production schema application must never load sample data.
         self.assertNotIn("db:seed", text)
         self.assertNotIn("--file", text)

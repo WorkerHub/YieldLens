@@ -1,8 +1,19 @@
 name: Apply D1 Schema
 
-# Manually apply worker/src/db/schema.sql to the organization's shared D1
-# database. The schema is idempotent (CREATE ... IF NOT EXISTS), so re-running
-# it is safe. Sample data (worker/seed.sql) is never applied here.
+# Manually apply the pending ledger-backed migrations to the organization's
+# shared D1 database. The migration manifest is the ordered list in
+# python-collector/common/migrations.py; today it holds one entry, schema_v1,
+# whose content is worker/src/db/schema.sql unchanged.
+#
+# Each unrecorded migration is applied one statement per request and recorded in
+# this prefix's ledger table (prefix YL -> _YL_schema_migrations) only after all
+# of its statements succeeded and the shape check passed. The run stops at the
+# first failing statement (that migration stays unrecorded, later ones are not
+# attempted, the job exits non-zero), and migrations already in the ledger are
+# skipped without sending any SQL. The first ledger-based run against an
+# existing database simply stamps schema_v1: its DDL is all CREATE ... IF NOT
+# EXISTS, so it no-ops on the existing tables and leaves the data alone.
+# Sample data (worker/seed.sql) is never applied here.
 #
 # Credentials come from organization-level variables/secrets, not from
 # wrangler.toml placeholders. The collector talks to the D1 HTTP API directly.
